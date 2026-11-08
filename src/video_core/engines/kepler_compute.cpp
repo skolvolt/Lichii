@@ -2300,11 +2300,71 @@ bool KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
         if (!memory_manager.IsFullyMappedRange(address, size)) {
             return false;
         }
+        // nup EDEN_NX2_PREDICT_REDUCTIONS (default on, 0 = off): a reduction (Ocarina's dispatch
+        // counters, whose acquires each drained the back) after an exact queued release of the word
+        // is that release's value reduced: a release with a known value too. Read before this
+        // reduction's own write is noted (which ends the earlier prediction).
+        static const bool predict_reductions = [] {
+            const char* v = std::getenv("EDEN_NX2_PREDICT_REDUCTIONS");
+            return v == nullptr || v[0] != '0';
+        }();
+        std::optional<VideoCommon::SemaphorePrediction> reduce_base;
+        if ((flags & (1U << 26)) != 0 && predict_reductions && !four_words) {
+            reduce_base = split.PredictedRelease(&memory_manager, address);
+        }
         FrontRecordRelease(address, payload, flags, split.WritePosition());
         split.NoteWrite(&memory_manager, address, size, true);
         if ((flags & (1U << 26)) != 0) {
-            split.ForgetRelease(&memory_manager, address);
+            static const bool stats = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+            if (stats) {
+                static u64 n_pred, n_nobase, n_atleast;
+                static std::unordered_map<GPUVAddr, u64> nobase;
+                static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                if (reduce_base && !reduce_base->at_least) {
+                    ++n_pred;
+                } else if (reduce_base) {
+                    ++n_atleast;
+                } else {
+                    ++n_nobase;
+                    ++nobase[address];
+                }
+                if (std::chrono::steady_clock::now() >= next) {
+                    next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                    std::string where;
+                    for (const auto& [a, n] : nobase) {
+                        if (where.size() < 200) where += fmt::format(" {:#x}x{}", a, n);
+                    }
+                    LOG_INFO(HW_GPU, "nup reductions 10 s: {} predicted, {} after an at-least release, "
+                             "{} without a known base:{} (op {} flags {:#x})", n_pred, n_atleast,
+                             n_nobase, where, (flags >> 20) & 7, flags);
+                    n_pred = n_nobase = n_atleast = 0;
+                    nobase.clear();
+                }
+            }
+            std::optional<u32> base;
+            if (reduce_base && !reduce_base->at_least) {
+                base = reduce_base->value;
+            } else if (predict_reductions && !four_words) {
+                const auto it = split.nup_counters.find(address);
+                if (it != split.nup_counters.end() && it->second.space == &memory_manager) {
+                    base = it->second.value;
+                }
+            }
+            if (base) {
+                const u32 value = ReduceSemaphore((flags >> 20) & 7, ((flags >> 24) & 1) != 0,
+                                                  *base, payload);
+                split.NoteRelease(&memory_manager, address, value, false);
+                split.nup_counters[address] = {&memory_manager, value};
+            } else {
+                split.ForgetRelease(&memory_manager, address);
+                split.nup_counters.erase(address);
+            }
         } else {
+            if ((flags & (1U << 19)) == 0) {
+                split.nup_counters[address] = {&memory_manager, payload}; // a plain release
+            } else {
+                split.nup_counters.erase(address);
+            }
             split.NoteRelease(&memory_manager, address, payload, (flags & (1U << 19)) != 0);
         }
         return true;

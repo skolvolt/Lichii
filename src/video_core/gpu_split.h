@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_map>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -389,10 +390,22 @@ public:
             if (nup_write_ring_on) [[unlikely]] {
                 nup_write_ring[nup_write_ring_next++ & 255] = {address, address + size, nup_source};
             }
+            // Any recorded write over a tracked counter forgets its value (the QMD release paths
+            // set it again after their write when they know it).
+            if (!nup_counters.empty()) [[unlikely]] {
+                for (auto it = nup_counters.begin(); it != nup_counters.end();) {
+                    it = it->first < address + size && address < it->first + 4 ? nup_counters.erase(it)
+                                                                                : std::next(it);
+                }
+            }
         }
     }
     /// nup EDEN_NX2_PREDICT_STATS: the last 256 recorded writes and their source (1 DMA copy,
     /// 2 3D inline upload, 3 compute inline upload, 4 constant buffer words, 0 other).
+    /// nup EDEN_NX2_PREDICT_REDUCTIONS: semaphore words the front knows the value of after all
+    /// queued work (a drained read, then reductions and plain releases it queued). Front only.
+    struct NupCounter { const void* space; u32 value; };
+    std::unordered_map<GPUVAddr, NupCounter> nup_counters;
     struct NupWrite { GPUVAddr begin, end; u8 source; };
     std::array<NupWrite, 256> nup_write_ring{};
     u32 nup_write_ring_next{};

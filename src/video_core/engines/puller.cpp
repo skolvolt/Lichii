@@ -126,6 +126,28 @@ bool PredictedMet(DmaPusher& dma_pusher, GPUVAddr address, const Matches& matche
         !(predicted->at_least ? at_least(predicted->value) : matches(predicted->value))) {
         return false;
     }
+    // nup EDEN_NX2_PREDICT_VERIFY: drain anyway and check the real word meets it too.
+    static const bool verify = std::getenv("EDEN_NX2_PREDICT_VERIFY") != nullptr;
+    if (verify) {
+        static u64 n_checked, n_wrong;
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        DrainBack();
+        const u32 real = ReadSemaphoreWord(dma_pusher, address);
+        ++n_checked;
+        if (!(predicted->at_least ? at_least(real) : matches(real))) {
+            ++n_wrong;
+            if (n_wrong <= 8) {
+                LOG_WARNING(HW_GPU, "nup prediction wrong at {:#x}: predicted {:#x}{} real {:#x}",
+                            address, predicted->value, predicted->at_least ? "+" : "", real);
+            }
+        }
+        if (std::chrono::steady_clock::now() >= next) {
+            next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            LOG_INFO(HW_GPU, "nup prediction verify 10 s: {} met predictions checked, {} wrong",
+                     n_checked, n_wrong);
+            n_checked = n_wrong = 0;
+        }
+    }
     split.NoteSyncAt(predicted->position, VideoCommon::UnboundedCause::PredictedSync);
     return true;
 }
@@ -245,8 +267,39 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
+    const auto nup_drain_start = std::chrono::steady_clock::now();
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    // nup EDEN_NX2_PREDICT_STATS: drained acquires by address, with the time each drain took.
+    static const bool drain_stats = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+    if (drain_stats) {
+        struct Stat { u64 count, ns, met, narrowed; };
+        static std::unordered_map<GPUVAddr, Stat> by_address;
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        auto& st = by_address[pending_acquire->address];
+        ++st.count;
+        st.ns += static_cast<u64>((std::chrono::steady_clock::now() - nup_drain_start).count());
+        st.met += pending_acquire->Matches(current) ? 1 : 0;
+        st.narrowed += narrowed ? 1 : 0;
+        if (std::chrono::steady_clock::now() >= next) {
+            next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            std::vector<std::pair<u64, GPUVAddr>> top;
+            for (const auto& [a, v] : by_address) top.emplace_back(v.ns, a);
+            std::sort(top.rbegin(), top.rend());
+            std::string where;
+            for (size_t i = 0; i < std::min<size_t>(6, top.size()); ++i) {
+                const auto& v = by_address[top[i].second];
+                where += fmt::format(" {:#x}: {}x {:.0f}ms met {} |", top[i].second, v.count,
+                                     v.ns / 1e6, v.met);
+            }
+            LOG_INFO(HW_GPU, "nup drained acquires 10 s ({} addresses):{}", by_address.size(), where);
+            by_address.clear();
+        }
+    }
+    // nup: drained, the word is current: reductions queued from here on build on it.
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.nup_counters[pending_acquire->address] = {&dma_pusher.memory_manager, current};
+    }
     if (narrowed) {
         VideoCommon::GpuSplit::ReportNarrowCheck(VideoCommon::DrainSite::NarrowAcquire,
                                                  *narrowed != current ? 1U : 0U, 0,
