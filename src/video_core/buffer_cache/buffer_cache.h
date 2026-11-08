@@ -1548,6 +1548,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // Ocarina of Time is left out (unless EDEN_NX2_PERF_VERIFY=1): a compare of its banks against
+    // shadow copies found no page changed behind the tracker, and the uploads cost frame rate.
+    constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
+    const bool bank_recheck = program_id != ocarina_of_time || Nx2Perf::Verify();
     // A bind that streams the buffer copies guest memory itself: the upload waits for the frame's
     // first bind that reads the host buffer (EDEN_NX2_BUFCACHE_BANK).
     const bool is_native_bank =
@@ -1557,7 +1561,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         Nx2BufCache::Note(Nx2BufCache::Stat::BankSkip);
     }
     const auto upload_bank = [&] {
-        if (!(is_native_bank && !bank_streamed && size != 0 && gpu_memory != nullptr &&
+        if (!(bank_recheck && is_native_bank && !bank_streamed && size != 0 && gpu_memory != nullptr &&
               gpu_memory->UsesNativeTiling() &&
               (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
               !memory_tracker.IsRegionGpuModified(device_addr, size) &&
