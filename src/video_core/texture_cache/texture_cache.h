@@ -493,14 +493,14 @@ void TextureCache<P>::TickFrame() {
         std::sort(shapes.rbegin(), shapes.rend());
         for (size_t i = 0; i < std::min<size_t>(10, shapes.size()); ++i) {
             const u64 key = shapes[i].second;
-            LOG_DEBUG(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
+            LOG_INFO(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
                      shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
                      (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
                      created_shapes[key].second);
         }
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
-        debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+        debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr; // nup: keep the shape tallies on
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
@@ -2322,6 +2322,47 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    // nup EDEN_NX2_UPLOAD_STATS (debug): every 10 s, the images re-uploaded most and their cost.
+    static const bool upload_stats = std::getenv("EDEN_NX2_UPLOAD_STATS") != nullptr;
+    struct UploadStat { u64 count, ns; ImageInfo info; bool layers; u32 gpu, first; };
+    static std::map<VAddr, UploadStat> upload_stat_map;
+    const auto upload_start = std::chrono::steady_clock::now();
+    const bool upload_layers = !image.dirty_layers.empty();
+    const bool upload_gpu = True(image.flags & ImageFlagBits::GpuModified);
+    const bool upload_first = False(image.flags & ImageFlagBits::Tracked);
+    SCOPE_EXIT {
+        if (!upload_stats) {
+            return;
+        }
+        auto& st = upload_stat_map[image.cpu_addr];
+        st.count++;
+        st.ns += static_cast<u64>((std::chrono::steady_clock::now() - upload_start).count());
+        st.info = image.info;
+        st.layers |= upload_layers;
+        st.gpu += upload_gpu ? 1 : 0;
+        st.first += upload_first ? 1 : 0;
+        static auto next_log = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        if (std::chrono::steady_clock::now() < next_log) {
+            return;
+        }
+        next_log = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        std::vector<std::pair<VAddr, UploadStat>> top(upload_stat_map.begin(), upload_stat_map.end());
+        std::sort(top.begin(), top.end(),
+                  [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
+            const auto& [addr, u] = top[i];
+            LOG_INFO(HW_GPU,
+                     "Upload stats: {:#x} {}x{}x{} fmt {} mips {} layers {} type {} bytes {} | "
+                     "{} uploads ({} GPU-written, {} first), {:.1f} ms{}",
+                     addr, u.info.size.width, u.info.size.height, u.info.size.depth,
+                     static_cast<u32>(u.info.format), u.info.resources.levels,
+                     u.info.resources.layers, static_cast<u32>(u.info.type),
+                     CalculateGuestSizeInBytes(u.info), u.count, u.gpu, u.first, u.ns / 1e6,
+                     u.layers ? " (layer uploads)" : "");
+        }
+        LOG_INFO(HW_GPU, "Upload stats: {} images in 10 s", upload_stat_map.size());
+        upload_stat_map.clear();
+    };
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -3570,7 +3611,71 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return false;
         }
     };
-    if (overwritten_by_clear()) {
+    // nup EDEN_NX2_RT_DEPTH_NOUPLOAD (default on, 0 = off): a new depth/stencil render target with
+    // no older GPU image to copy from starts without the upload from guest memory. Guest memory
+    // never receives the GPU's depth (no write-back), so the upload only copied stale bytes the
+    // game then clears or draws over. Ocarina makes ~2.5 such targets a frame (shadow cascades
+    // sized anew each frame: 259x259 ... 888x888 D32), ~5.5 MB of CPU swizzling a frame.
+    const auto nup_skip_depth_upload = [&] {
+        static const bool enabled = [] {
+            const char* v = std::getenv("EDEN_NX2_RT_DEPTH_NOUPLOAD");
+            return v == nullptr || v[0] != '0';
+        }();
+        const auto type = VideoCore::Surface::GetFormatType(new_info.format);
+        if (std::getenv("EDEN_NX2_UPLOAD_STATS") != nullptr &&
+            type == VideoCore::Surface::SurfaceType::Depth) {
+            static u64 n_rt, n_tex, n_copies, n_overlaps;
+            static auto next = std::chrono::steady_clock::now();
+            (clearing_render_targets_lookup ? n_rt : n_tex)++;
+            static u32 shown = 0;
+            if (!clearing_render_targets_lookup && !join_copies_to_do.empty() && shown < 12) {
+                ++shown;
+                const ImageInfo& o = slot_images[join_copies_to_do[0].id].info;
+                const ImageBase& ob = slot_images[join_copies_to_do[0].id];
+                LOG_INFO(HW_GPU,
+                         "nup depth tex {:#x} {}x{} fmt {} blk {}x{}x{} tws {} pitch {} lvl {} | "
+                         "copy from {:#x} {}x{} fmt {} blk {}x{}x{} tws {} pitch {} lvl {} alias {} "
+                         "({} copies)",
+                         gpu_addr, new_info.size.width, new_info.size.height,
+                         static_cast<u32>(new_info.format), new_info.block.width,
+                         new_info.block.height, new_info.block.depth, new_info.tile_width_spacing,
+                         new_info.pitch, new_info.resources.levels, ob.gpu_addr, o.size.width,
+                         o.size.height, static_cast<u32>(o.format), o.block.width, o.block.height,
+                         o.block.depth, o.tile_width_spacing, o.pitch, o.resources.levels,
+                         join_copies_to_do[0].is_alias, join_copies_to_do.size());
+            }
+            n_copies += join_copies_to_do.empty() ? 0 : 1;
+            n_overlaps += join_overlap_ids.empty() ? 0 : 1;
+            if (std::chrono::steady_clock::now() >= next) {
+                next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                LOG_INFO(HW_GPU, "nup depth creations: {} as render targets, {} as textures, {} with "
+                         "join copies, {} with overlaps", n_rt, n_tex, n_copies, n_overlaps);
+                n_rt = n_tex = n_copies = n_overlaps = 0;
+            }
+        }
+        const bool depth = type == VideoCore::Surface::SurfaceType::Depth ||
+                           type == VideoCore::Surface::SurfaceType::Stencil ||
+                           type == VideoCore::Surface::SurfaceType::DepthStencil;
+        if (!enabled || !depth) {
+            return false;
+        }
+        // A render target with nothing to copy, or (sampled shadow maps: ~2 a frame, made for a
+        // texture descriptor shaped unlike the target) every copy from a GPU-drawn image: guest
+        // memory holds nothing the GPU drew, so the upload under the copies is stale either way.
+        if (join_copies_to_do.empty()) {
+            return clearing_render_targets_lookup;
+        }
+        return std::ranges::all_of(join_copies_to_do, [this](const JoinCopy& copy) {
+            return True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
+        });
+    };
+    if (nup_skip_depth_upload()) {
+        // As RefreshContents leaves it, without the upload (also when a partial clear creates it:
+        // PrepareImage would upload it then).
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        TrackImage(new_image, new_image_id);
+        runtime.TransitionImageLayout(new_image);
+    } else if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);

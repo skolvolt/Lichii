@@ -3320,6 +3320,27 @@ void BufferCache<P>::UploadNativeBank(Buffer& buffer, DAddr device_addr, u64 upl
             slot = std::make_unique<BankShadow>();
         }
         BankShadow& shadow = *slot;
+        // nup EDEN_NX2_BANK_BACKOFF=<frames> (default 16, 0 = off): a bank whose compares keep
+        // finding nothing changed (Ocarina: ~3 changes in 7,000 rechecks) is compared every 2, 4,
+        // ... up to <frames> frames instead of every frame, and every frame again once it changes.
+        // Only with every page's shadow valid: other host writes and GPU-written pages clear it.
+        // ponytail: an unnoticed guest write to a quiet bank shows up to <frames> frames late.
+        static const u32 bank_backoff = [] {
+            const char* v = std::getenv("EDEN_NX2_BANK_BACKOFF");
+            return v != nullptr ? static_cast<u32>(std::atoi(v)) : 16u;
+        }();
+        if (bank_backoff > 1 && frame_tick < shadow.next_frame) {
+            u32 all = 0;
+            u32 bank_page = 0;
+            for (u64 offset = 0; offset < upload_size && bank_page < 32; ++bank_page) {
+                all |= 1U << bank_page;
+                offset += Core::DEVICE_PAGESIZE - ((device_addr + offset) & Core::DEVICE_PAGEMASK);
+            }
+            if ((shadow.valid & all) == all) {
+                ++nup_bank_skips;
+                return;
+            }
+        }
         shadow.compared_frame = frame_tick;
         Nx2BufCache::Note(Nx2BufCache::Stat::BankCompare);
         const u64 base_offset = buffer.Offset(device_addr);
@@ -3366,6 +3387,10 @@ void BufferCache<P>::UploadNativeBank(Buffer& buffer, DAddr device_addr, u64 upl
                 total_size += length;
             }
             offset += length;
+        }
+        if (bank_backoff > 1) {
+            shadow.interval = total_size == 0 ? (std::min)(shadow.interval * 2, bank_backoff) : 1;
+            shadow.next_frame = frame_tick + shadow.interval;
         }
         if (total_size == 0) {
             return;

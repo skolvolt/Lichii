@@ -699,11 +699,14 @@ private:
         std::array<u8, 0x10000> bytes{};
         u32 valid{};
         u64 compared_frame{}; ///< frame_tick of the last compare (EDEN_NX2_BANK_LRU)
+        u64 next_frame{};     ///< nup EDEN_NX2_BANK_BACKOFF: first frame to compare again
+        u32 interval{1};      ///< frames between compares, doubled per unchanged compare
     };
 
     /// The once-a-frame upload of a native uniform bank: only the pages whose guest bytes
     /// differ from what was uploaded last time.
     void UploadNativeBank(Buffer& buffer, DAddr device_addr, u64 upload_size);
+    u64 nup_bank_skips{}; ///< nup: bank compares skipped by EDEN_NX2_BANK_BACKOFF
 
     /// Host buffer writes other than UploadNativeBank over [device_addr, device_addr + size).
     void InvalidateBankShadows(DAddr device_addr, u64 size);

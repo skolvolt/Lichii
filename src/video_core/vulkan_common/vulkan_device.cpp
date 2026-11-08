@@ -797,6 +797,32 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    // nup EDEN_NX2_VMA_NO_PREFER_DEDICATED (default on, 0 = off): images the driver only *prefers*
+    // in their own memory (NVIDIA: render and depth targets) are placed in VMA's blocks instead.
+    // Ocarina creates and frees ~2-3 short-lived depth targets a frame (shadow cascades sized anew
+    // each frame); each dedicated allocation was a kernel allocate, bind and free on the GPU thread.
+    // Required dedicated allocations stay dedicated.
+    static PFN_vkGetImageMemoryRequirements2 nup_real_image_requirements2 = nullptr;
+    if (const char* v = std::getenv("EDEN_NX2_VMA_NO_PREFER_DEDICATED"); v == nullptr || v[0] != '0') {
+        nup_real_image_requirements2 = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
+            dld.vkGetDeviceProcAddr(*logical, "vkGetImageMemoryRequirements2"));
+        if (nup_real_image_requirements2 != nullptr) {
+            functions.vkGetImageMemoryRequirements2KHR =
+                [](VkDevice device, const VkImageMemoryRequirementsInfo2* info,
+                   VkMemoryRequirements2* requirements) {
+                    nup_real_image_requirements2(device, info, requirements);
+                    for (auto* next = static_cast<VkBaseOutStructure*>(requirements->pNext);
+                         next != nullptr; next = next->pNext) {
+                        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+                            auto* dedicated = reinterpret_cast<VkMemoryDedicatedRequirements*>(next);
+                            if (!dedicated->requiresDedicatedAllocation) {
+                                dedicated->prefersDedicatedAllocation = VK_FALSE;
+                            }
+                        }
+                    }
+                };
+        }
+    }
 
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {
