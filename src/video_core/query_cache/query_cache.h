@@ -470,7 +470,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     // Without delayed fence operations only fence-flagged reports wait for the host GPU to write.
-    const bool delayed_release = is_fence && counter_type == QueryType::Payload &&
+    // Four-word releases stay waited for: a CPU copy of one after the acquire would miss the
+    // timestamp the fence writes.
+    const bool delayed_release = is_fence && counter_type == QueryType::Payload && !has_timestamp &&
                                  (Settings::IsGPUFenceBehaviorDefault()
                                       ? !Settings::IsGPULevelHigh()
                                       : !Settings::IsGPUFenceBehaviorBalanced() &&

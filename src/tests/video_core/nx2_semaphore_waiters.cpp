@@ -43,3 +43,15 @@ TEST_CASE("A finished release leaves a newer delayed release in place", "[video_
     waiters.OnDelayedReleaseDone(address, 7);
     waiters.Remove(&owner);
 }
+
+TEST_CASE("A new session drops delayed releases whose fence never ran", "[video_core][nx2]") {
+    auto& waiters = Waiters::Get();
+    const int owner = 0;
+
+    waiters.OnDelayedRelease(address, 8);
+    waiters.ClearDelayedReleases();
+    waiters.Add(&owner, address, 8, Waiters::AcquireEqual);
+    CHECK_FALSE(waiters.Latched(&owner));
+
+    waiters.Remove(&owner);
+}
