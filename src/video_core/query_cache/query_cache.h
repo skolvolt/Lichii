@@ -535,6 +535,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return value == payload;
     };
     if (is_fence) {
+        // nup merge: upstream #337 keeps fence-flagged reports pending until their fence runs
+        // (Ocarina white flashes at low accuracy); #717's early "synced" release is off.
+        constexpr bool is_synced = false;
         const bool lazy_fence = lazy_payload && is_synced;
         if (lazy_fence) {
             streamer->MarkInFlight(new_query_id);

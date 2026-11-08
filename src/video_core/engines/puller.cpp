@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <map>
 #include <algorithm>
 #include <chrono>
 #include <unordered_map>
@@ -61,9 +62,31 @@ void OnBack(const Func& func) {
     }
 }
 
-void DrainBack() {
+void DrainBackImpl(int line) {
+    // nup EDEN_NX2_PREDICT_STATS: drain time by call site, every 10 s.
+    static const bool stats = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+    if (!stats) {
+        VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+        return;
+    }
+    static std::map<int, std::pair<u64, u64>> by_line;
+    static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    const auto start = std::chrono::steady_clock::now();
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+    auto& entry = by_line[line];
+    ++entry.first;
+    entry.second += static_cast<u64>((std::chrono::steady_clock::now() - start).count());
+    if (std::chrono::steady_clock::now() >= next) {
+        next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        std::string text;
+        for (const auto& [l, v] : by_line) {
+            text += fmt::format(" line {}: {}x {:.0f} ms |", l, v.first, v.second / 1e6);
+        }
+        LOG_INFO(HW_GPU, "nup acquire drains 10 s:{}", text);
+        by_line.clear();
+    }
 }
+#define DrainBack() DrainBackImpl(__LINE__)
 
 // A semaphore release just queued for the back: the payload, and the time stamp unless it is a
 // one-word release (IsAFence without HasTimeout), for the narrow drains.
@@ -489,6 +512,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // nup EDEN_NX2_ACQUIRE_TRIVIAL (default on, 0 = off): an unsigned "at least 0" acquire is
+        // met whatever the word holds; hardware never waits on it. Ocarina issues ~1,000 a second
+        // on the syncpoint shim (0xc0fffff000, no guest memory behind it), and the ones the cheap
+        // checks couldn't read drained the back (~45 a second, ~75 ms a second of the front).
+        static const bool trivial = [] {
+            const char* v = std::getenv("EDEN_NX2_ACQUIRE_TRIVIAL");
+            return v == nullptr || v[0] != '0';
+        }();
+        if (trivial && op == GpuSemaphoreOperation::AcquireGequal && acquire.value == 0) {
+            return;
+        }
         // Already met: as in CanResumeAcquire.
         if (PredictedMet(
                 dma_pusher, acquire.address, [&acquire](u32 value) { return acquire.Matches(value); },
@@ -514,11 +548,64 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     VideoCommon::UnboundedCause::AcquireSync);
                 return;
             }
+        } else if (narrowed) {
+            // nup EDEN_NX2_ACQUIRE_SKIP_DRAIN=1 (experiment): a word the narrow read could read,
+            // unmet, on a GPU completion slot (a queued "at least" release that doesn't meet it
+            // yet): only the host GPU finishing that work meets it, which a full drain of the back
+            // doesn't speed up (~2 ms each, ~90 a second). Suspend now; the channel polls as usual.
+            static const bool skip_drain = std::getenv("EDEN_NX2_ACQUIRE_SKIP_DRAIN") != nullptr;
+            if (skip_drain) {
+                auto& split = VideoCommon::GpuSplit::Get();
+                const auto predicted = split.PredictedRelease(&dma_pusher.memory_manager, acquire.address);
+                if (predicted && predicted->at_least) {
+                    if (const auto device =
+                            dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+                        Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value,
+                                                       acquire.operation);
+                    }
+                    pending_acquire = acquire;
+                    dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+                    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                    return;
+                }
+            }
+            narrowed.reset();
         } else {
             narrowed.reset();
         }
+        const auto nup_start = std::chrono::steady_clock::now();
         DrainBack();
         const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
+        // nup: drained, the word is current: reductions queued from here on build on it.
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.nup_counters[acquire.address] = {&dma_pusher.memory_manager, current};
+        }
+        static const bool nup_stats = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+        if (nup_stats) {
+            struct Stat { u64 count, ns, met; };
+            static std::unordered_map<GPUVAddr, Stat> by_address;
+            static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            auto& st = by_address[acquire.address];
+            ++st.count;
+            st.ns += static_cast<u64>((std::chrono::steady_clock::now() - nup_start).count());
+            st.met += acquire.Matches(current) ? 1 : 0;
+            if (std::chrono::steady_clock::now() >= next) {
+                next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                std::vector<std::pair<u64, GPUVAddr>> top;
+                for (const auto& [a, v] : by_address) top.emplace_back(v.ns, a);
+                std::sort(top.rbegin(), top.rend());
+                std::string where;
+                for (size_t i = 0; i < std::min<size_t>(6, top.size()); ++i) {
+                    const auto& v = by_address[top[i].second];
+                    where += fmt::format(" {:#x}: {}x {:.0f}ms met {} op {} value {:#x} |",
+                                         top[i].second, v.count, v.ns / 1e6, v.met,
+                                         acquire.operation, acquire.value);
+                }
+                LOG_INFO(HW_GPU, "nup first-acquire drains 10 s ({} addresses):{}",
+                         by_address.size(), where);
+                by_address.clear();
+            }
+        }
         if (narrowed) {
             VideoCommon::GpuSplit::ReportNarrowCheck(VideoCommon::DrainSite::NarrowAcquire,
                                                      *narrowed != current ? 1U : 0U, 0,

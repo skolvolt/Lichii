@@ -111,6 +111,13 @@ bool MaxwellDMA::FrontMethod(u32 method, u32 argument, u64 session, FrontLaunchW
     if (launch.semaphore_type != LaunchDMA::SemaphoreType::NONE) {
         const GPUVAddr semaphore = front.semaphore.address;
         add(semaphore, semaphore + 16);
+        // As ReleaseSemaphore: a plain payload release (one or four words), no reduction.
+        if (launch.semaphore_type == LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE ||
+            launch.semaphore_type == LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+            writes.release = true;
+            writes.release_address = semaphore;
+            writes.release_payload = front.semaphore.payload;
+        }
         // A release or report the back may hold in its query cache (GpuSplit::MayHoldReports).
         VideoCommon::GpuSplit::NoteGpuSemaphore(semaphore);
     }

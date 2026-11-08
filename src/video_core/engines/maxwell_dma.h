@@ -257,6 +257,10 @@ public:
         std::array<std::pair<GPUVAddr, GPUVAddr>, 2> ranges{};
         u32 count{};
         bool bounded{true}; ///< False for a block-linear destination
+        /// nup: the semaphore payload release after the copy, if any (predicted by the front).
+        bool release{};
+        GPUVAddr release_address{};
+        u32 release_payload{};
     };
     /// Split GPU thread front (GpuSplit::NarrowDrains), for each method it sends before sending
     /// it: keeps a copy of the registers as the back will hold them (rebuilt from the back's in a

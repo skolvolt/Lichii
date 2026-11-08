@@ -653,6 +653,9 @@ DmaPusher::BackWrites DmaPusher::FrontBackWrites(Engines::EngineInterface& engin
             writes.writer = true;
             writes.unbounded |= !launch.bounded;
             writes.cause = VideoCommon::UnboundedCause::BlockLinearDma;
+            writes.release = launch.release; // the last launch's (earlier ones: not predicted)
+            writes.release_address = launch.release_address;
+            writes.release_payload = launch.release_payload;
             for (u32 range = 0; range < launch.count; ++range) {
                 if (writes.count == writes.ranges.size()) {
                     writes.unbounded = true;
@@ -680,6 +683,15 @@ void DmaPusher::NoteBackWrites(const BackWrites& writes) {
     }
     if (writes.unbounded) {
         split.NoteUnboundedWrite(writes.writer, writes.cause);
+    }
+    // nup EDEN_NX2_PREDICT_DMA_RELEASE (default on, 0 = off): the copy's semaphore release has a
+    // known value (Ocarina's 0xc0fffff000 acquires drained the back ~45 times a second for it).
+    static const bool predict_dma_release = [] {
+        const char* v = std::getenv("EDEN_NX2_PREDICT_DMA_RELEASE");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (writes.release && predict_dma_release && split.SemaphorePredict()) {
+        split.NoteRelease(&memory_manager, writes.release_address, writes.release_payload);
     }
 }
 

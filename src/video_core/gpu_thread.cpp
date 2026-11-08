@@ -105,7 +105,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
-                    if (waited < std::chrono::microseconds{500}) {
+                    // nup EDEN_NX2_PENDING_SPIN_US: how long to yield before sleeping (default 500).
+                    static const auto spin_window = std::chrono::microseconds{[] {
+                        const char* v = std::getenv("EDEN_NX2_PENDING_SPIN_US");
+                        return v != nullptr ? std::atoll(v) : 500LL;
+                    }()};
+                    if (waited < spin_window) {
                         std::this_thread::yield();
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32

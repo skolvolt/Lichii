@@ -216,6 +216,9 @@ private:
         bool unbounded{};
         bool writer{}; ///< Compute or copy work (GpuSplit::NoteUnboundedWrite)
         VideoCommon::UnboundedCause cause{}; ///< GpuSplit::NoteUnboundedWrite
+        bool release{}; ///< nup: a DMA semaphore payload release to predict after the writes
+        GPUVAddr release_address{};
+        u32 release_payload{};
     };
     BackWrites FrontBackWrites(Engines::EngineInterface& engine, Engines::EngineTypes type,
                                u32 method, const u32* arguments, u32 count);
