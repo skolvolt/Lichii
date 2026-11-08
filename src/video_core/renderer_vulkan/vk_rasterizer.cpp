@@ -2073,11 +2073,27 @@ bool RasterizerVulkan::IsGpuTickDone(u64 tick) {
     if (scheduler.IsFree(tick)) {
         return true;
     }
+    // The GPU thread polls a channel suspended on a list copy back to back (it spins for 500 us
+    // before it sleeps): ~190,000 polls a second on Windows. Each asked the back to submit (a
+    // futex wake, a kernel call on Windows) and the driver for the semaphore's value (also a
+    // kernel call there). Both are needed far less often than that.
+    const auto now = std::chrono::steady_clock::now();
     // A deferred submission (Scheduler::DeferFlush) is only made by the split's back: ask it to
-    // submit, or the tick never completes while the front polls.
-    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active()) {
+    // submit, or the tick never completes while the front polls. Once per tick is enough (the
+    // hook submits everything deferred, so also every earlier tick); again after a millisecond
+    // in case it raced.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+        (tick > poll_submit_requested_tick ||
+         now - poll_submit_requested_at > std::chrono::milliseconds{1})) {
         VideoCommon::GpuSplit::Get().RequestIdleHook();
+        poll_submit_requested_tick = (std::max)(poll_submit_requested_tick, tick);
+        poll_submit_requested_at = now;
     }
+    // The GPU's progress, from the driver at most every 20 us (a copy takes longer than that).
+    if (now - poll_refreshed_at < std::chrono::microseconds{20}) {
+        return false;
+    }
+    poll_refreshed_at = now;
     scheduler.GetMasterSemaphore().Refresh();
     return scheduler.IsFree(tick);
 }
