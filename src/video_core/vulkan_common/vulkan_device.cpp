@@ -853,7 +853,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
+            // nup EDEN_NX2_VMA_BLOCK_MIB (default 32): Ocarina docked makes 6-9 MiB shadow-map depth
+            // targets anew every frame; over half a 16 MiB block each was its own allocation (a kernel
+            // allocate, bind and free on the GPU thread, ~6% of it).
+            .preferredLargeHeapBlockSize = [] {
+                const char* v = std::getenv("EDEN_NX2_VMA_BLOCK_MIB");
+                const u64 mib = v != nullptr ? std::strtoull(v, nullptr, 10) : 32;
+                return (mib != 0 ? mib : 16) * 1024u * 1024u;
+            }(),
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,

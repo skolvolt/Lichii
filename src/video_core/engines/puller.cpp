@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
 #include <atomic>
 #include <cstdlib>
 
@@ -84,6 +87,41 @@ bool PredictedMet(DmaPusher& dma_pusher, GPUVAddr address, const Matches& matche
     }
     const std::optional<VideoCommon::SemaphorePrediction> predicted =
         split.PredictedRelease(&dma_pusher.memory_manager, address);
+    // nup EDEN_NX2_PREDICT_STATS: why acquires are not predicted, every 10 s.
+    static const bool predict_stats = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+    if (predict_stats) {
+        static u64 n_hit, n_none, n_unmet, n_atleast;
+        static std::unordered_map<GPUVAddr, u64> none_addrs;
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        const bool met = predicted && (predicted->at_least ? at_least(predicted->value)
+                                                           : matches(predicted->value));
+        if (!predicted) {
+            ++n_none;
+            ++none_addrs[address];
+        } else if (!met) {
+            ++n_unmet;
+        } else {
+            ++n_hit;
+            n_atleast += predicted->at_least ? 1 : 0;
+        }
+        if (std::chrono::steady_clock::now() >= next) {
+            next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            std::vector<std::pair<u64, GPUVAddr>> top;
+            for (const auto& [a, n] : none_addrs) {
+                top.emplace_back(n, a);
+            }
+            std::sort(top.rbegin(), top.rend());
+            std::string where;
+            for (size_t i = 0; i < std::min<size_t>(6, top.size()); ++i) {
+                where += fmt::format(" {:#x}x{}", top[i].second, top[i].first);
+            }
+            LOG_INFO(HW_GPU, "nup acquire prediction 10 s: met {} ({} at-least), no queued release "
+                     "{}, predicted but unmet {}; no-release addresses ({}):{}", n_hit, n_atleast,
+                     n_none, n_unmet, none_addrs.size(), where);
+            n_hit = n_none = n_unmet = n_atleast = 0;
+            none_addrs.clear();
+        }
+    }
     if (!predicted ||
         !(predicted->at_least ? at_least(predicted->value) : matches(predicted->value))) {
         return false;
