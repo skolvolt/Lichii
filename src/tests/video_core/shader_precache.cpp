@@ -13,6 +13,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_warm/shader_archives.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
 
@@ -182,6 +183,30 @@ TEST_CASE("ShaderPrecache: a program naming no texture bank reads bank 0", "[vid
     // num_envs, then six u64 counts and local memory before the texture bank.
     std::memcpy(&texture_bound, entry.data() + 4 + 6 * 8 + 4, sizeof(texture_bound));
     REQUIRE(texture_bound == 0);
+}
+
+TEST_CASE("ShaderPrecache: every container the archive walker reads is discovered",
+          "[video_core]") {
+    using ShaderWarm::ClassifyGameFile;
+    using ShaderWarm::GameFileKind;
+    for (const char* path : {"Shader/Model.product.nin_ounce_nvn2.bfsha.zs",
+                             "Shader/Model.bfsha", "Pack/Shaders.nin_ounce_nvn2.release.sarc.zs",
+                             "Pack/Shaders.release.sarc", "Shader/Loose.bnsh",
+                             "Shader/Loose.bnsh.zs", "Shader/Bundle.cgsb", "Shader/Bundle.cgsb.zs",
+                             "Shader/Program.shn", "Shader/Program.shn.zs", "Shader/Archive.sharcb",
+                             "Shader/Archive.sharcb.zs", "Shader/UPPER.BNSH", "Effect/Fx.bfsha.zs"}) {
+        INFO(path);
+        REQUIRE(ClassifyGameFile(path) == GameFileKind::ShaderArchive);
+    }
+    REQUIRE(ClassifyGameFile("Effect/Fx.nin_ounce_nvn2.vsetb.byml.zs") == GameFileKind::Effect);
+    REQUIRE(ClassifyGameFile("Pack/ZsDic.pack.zs") == GameFileKind::ZstdDictionaries);
+    for (const char* path :
+         {"Effect/Sub/Fx.vsetb.byml.zs", "Model/Fx.vsetb.byml.zs", "Effect/Fx.vsetb.byml",
+          "Model/Tex.bntx.zs", "Model/Mesh.bfres.zs", "Asset/assets_a000.dat",
+          "Bin/Nvn2-upper_left.ndsr", "Shader/notes.shn.txt", "Shader/bnsh"}) {
+        INFO(path);
+        REQUIRE(ClassifyGameFile(path) == GameFileKind::Other);
+    }
 }
 
 TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video_core]") {

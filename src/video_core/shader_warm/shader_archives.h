@@ -8,6 +8,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "common/common_types.h"
@@ -64,6 +65,17 @@ public:
 private:
     std::unordered_map<u32, ZSTD_DDict_s*> dictionaries;
 };
+
+/// What the precache builder does with a RomFS file.
+enum class GameFileKind : u8 {
+    Other,            ///< Not read
+    ShaderArchive,    ///< *.bfsha, *.sarc, *.bnsh, *.cgsb, *.shn or *.sharcb, raw or zstd (.zs)
+    Effect,           ///< Effect/*.vsetb.byml.zs, read after every shader archive
+    ZstdDictionaries, ///< Pack/ZsDic.pack.zs
+};
+
+/// Kind of the RomFS file at `path` ('/' separated, file extensions in any case).
+[[nodiscard]] GameFileKind ClassifyGameFile(std::string_view path);
 
 /// Walks one archive file (zstd, DCX, SARC, BND4, BFSHA, BNSH, effect bundles, CGSB, SHN, BAHS)
 /// and calls `on_record` for every shader program found. Errors inside a SARC or BND4 member

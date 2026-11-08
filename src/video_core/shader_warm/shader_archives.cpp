@@ -873,6 +873,27 @@ const ZSTD_DDict_s* ZstdDictionaries::Find(u32 id) const {
     return it == dictionaries.end() ? nullptr : it->second;
 }
 
+GameFileKind ClassifyGameFile(std::string_view path) {
+    if (path == "Pack/ZsDic.pack.zs") {
+        return GameFileKind::ZstdDictionaries;
+    }
+    std::string lower = Lower(path);
+    if (EndsWith(lower, ".zs")) {
+        lower.resize(lower.size() - 3);
+    }
+    for (const std::string_view extension :
+         {".bfsha", ".sarc", ".bnsh", ".cgsb", ".shn", ".sharcb"}) {
+        if (EndsWith(lower, extension)) {
+            return GameFileKind::ShaderArchive;
+        }
+    }
+    if (path.starts_with("Effect/") && path.find('/', 7) == std::string_view::npos &&
+        EndsWith(path, ".vsetb.byml.zs")) {
+        return GameFileKind::Effect;
+    }
+    return GameFileKind::Other;
+}
+
 void WalkArchive(std::span<const u8> data, const std::string& name,
                  const ZstdDictionaries* dictionaries,
                  const std::function<void(const ShaderRecord&)>& on_record,
