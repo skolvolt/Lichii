@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <unordered_set>
 #include <map>
 #include <algorithm>
 #include <chrono>
@@ -538,6 +539,21 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             NoteAcquireSync(acquire.address);
             return;
         }
+        // nup EDEN_NX2_ACQUIRE_LEARN_SLOW=1: addresses whose drained read came back unmet (GPU
+        // completion slots: only the host GPU finishing work meets them) suspend at once, so the
+        // front goes on with the other channels (whose work may be what releases them) instead of
+        // draining the back first (~2 ms each). One met after a drain leaves the set.
+        static const bool learn_slow = std::getenv("EDEN_NX2_ACQUIRE_LEARN_SLOW") != nullptr;
+        static std::unordered_set<GPUVAddr> slow_addresses;
+        if (learn_slow && slow_addresses.contains(acquire.address)) {
+            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+                Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+            }
+            pending_acquire = acquire;
+            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+            return;
+        }
         // Not met in guest memory: the release may still be queued for the back, so check it
         // with the drained read below before suspending (see CanResumeAcquire). Suspending at
         // once left the channel to the pending-channel polling, whose latency halved the FPS.
@@ -610,6 +626,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::GpuSplit::ReportNarrowCheck(VideoCommon::DrainSite::NarrowAcquire,
                                                      *narrowed != current ? 1U : 0U, 0,
                                                      acquire.address);
+        }
+        if (learn_slow) {
+            if (acquire.Matches(current)) {
+                slow_addresses.erase(acquire.address);
+            } else {
+                slow_addresses.insert(acquire.address);
+            }
         }
         if (acquire.Matches(current)) {
             return;
