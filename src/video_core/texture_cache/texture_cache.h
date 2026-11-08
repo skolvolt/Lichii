@@ -466,8 +466,8 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "nup: {} render targets relocated in 600 frames", nup_relocated);
-        nup_relocated = 0;
+        LOG_INFO(HW_GPU, "nup: {} render targets relocated ({} from the pool) in 600 frames", nup_relocated, nup_pooled);
+        nup_relocated = nup_pooled = 0;
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
@@ -3242,6 +3242,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
             reuse_id = id;
         });
+        // Mode 3: nothing of this shape overlaps (small targets such as Ocarina's 384x384 shadow
+        // tiles move further than their own size): any image of the shape the GPU drew into and
+        // nothing has touched for 3 frames, oldest first, is taken over instead of a new one.
+        // ponytail: linear LRU scan per new target (a few thousand images, ~5 new targets a frame).
+        if (!reuse_id && nup_relocate >= 3 && frame_tick > 3) {
+            lru_cache.ForEachItemBelow(frame_tick - 3, [&](ImageId id) {
+                ImageBase& image = slot_images[id];
+                if (!same_shape(image.info) || False(image.flags & ImageFlagBits::GpuModified) ||
+                    True(image.flags & (ImageFlagBits::Remapped | ImageFlagBits::Sparse |
+                                        ImageFlagBits::IsDecoding | ImageFlagBits::Rescaled))) {
+                    return false;
+                }
+                reuse_id = id;
+                ++nup_pooled;
+                return true;
+            });
+        }
         if (reuse_id) {
             Image& image = slot_images[reuse_id];
             if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -3290,14 +3307,22 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                     render_targets.depth_buffer_id = ImageViewId{};
                 }
             }
+            // Address-keyed lookups (TIC views) go; the views themselves and their framebuffers
+            // depend only on the VkImage: they move with it.
             RemoveImageViewReferences(view_ids);
-            RemoveFramebuffers(view_ids);
+            const GPUVAddr old_gpu_addr = image.gpu_addr;
             for (const ImageViewId view_id : view_ids) {
-                sentenced_image_view.Push(std::move(slot_image_views[view_id]));
-                slot_image_views.erase(view_id);
+                auto& view = slot_image_views[view_id];
+                view.gpu_addr = view.gpu_addr - old_gpu_addr + gpu_addr;
             }
-            image.image_view_ids.clear();
-            image.image_view_infos.clear();
+            // As a deletion does: no memo (#717 binding and render target memos) keeps its views.
+            ++bindings_epoch;
+            BumpBindingSerial(reuse_id);
+            BumpBindingEpoch();
+            std::ranges::replace(rt_image_id, reuse_id, ImageId{});
+            if (rt_depth_image_id == reuse_id) {
+                rt_depth_image_id = ImageId{};
+            }
             image.gpu_addr = gpu_addr;
             image.cpu_addr = cpu_addr;
             image.cpu_addr_end = cpu_addr + image.guest_size_bytes;

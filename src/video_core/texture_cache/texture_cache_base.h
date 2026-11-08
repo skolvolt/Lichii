@@ -193,7 +193,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
     u64 async_decodes_queued{};
     u64 images_created{};
-    u64 nup_relocated{}; ///< nup: TC_LOG counter
+    u64 nup_relocated{}, nup_pooled{}; ///< nup: TC_LOG counters
     bool clearing_render_targets_lookup{}; ///< nup: JoinImages runs for a render target lookup
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
