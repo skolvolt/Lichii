@@ -2101,7 +2101,8 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             // A payload release (no counter, no reduction): its value is known now.
             if (query.query.operation == Regs::ReportSemaphore::Operation::Release &&
                 query.query.report == Regs::ReportSemaphore::Report::Payload &&
-                query.query.reduction_enable == 0) {
+                query.query.reduction_enable == 0 &&
+                (query.query.short_query == 0 || VideoCommon::GpuSplit::PredictFenceReports())) {
                 split.NoteRelease(&memory_manager, report,
                                   fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]);
             } else {

@@ -406,6 +406,16 @@ public:
     }
     /// nup EDEN_NX2_PREDICT_STATS: the last 256 recorded writes and their source (1 DMA copy,
     /// 2 3D inline upload, 3 compute inline upload, 4 constant buffer words, 0 other).
+    /// nup EDEN_NX2_PREDICT_FENCE_REPORTS (default on, 0 = off): predict one-word (fence-flagged)
+    /// report releases. Upstream #337 delays their writes until the host GPU ran the work before
+    /// them (Ocarina white flashes); a prediction lets the front run past that. Off: they wait.
+    static bool PredictFenceReports() {
+        static const bool on = [] {
+            const char* v = std::getenv("EDEN_NX2_PREDICT_FENCE_REPORTS");
+            return v == nullptr || v[0] != '0';
+        }();
+        return on;
+    }
     /// nup EDEN_NX2_PREDICT_REDUCTIONS: semaphore words the front knows the value of after all
     /// queued work (a drained read, then reductions and plain releases it queued). Front only.
     struct NupCounter { const void* space; u32 value; };

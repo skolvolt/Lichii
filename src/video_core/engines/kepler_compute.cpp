@@ -2202,7 +2202,8 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
         // Bit 28: a one-word structure, without the time stamp.
         split.NoteWrite(&memory_manager, address, ((argument >> 28) & 1) != 0 ? 4 : 16, true);
         const u32 operation = argument & 3;
-        if ((operation == 0 || operation == 2) && ((argument >> 3) & 1) == 0) {
+        if ((operation == 0 || operation == 2) && ((argument >> 3) & 1) == 0 &&
+            (((argument >> 28) & 1) == 0 || VideoCommon::GpuSplit::PredictFenceReports())) {
             split.NoteRelease(&memory_manager, address, fs.registers[0x6c2]);
         } else {
             split.ForgetRelease(&memory_manager, address);

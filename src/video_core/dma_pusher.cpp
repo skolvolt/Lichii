@@ -690,7 +690,8 @@ void DmaPusher::NoteBackWrites(const BackWrites& writes) {
         const char* v = std::getenv("EDEN_NX2_PREDICT_DMA_RELEASE");
         return v == nullptr || v[0] != '0';
     }();
-    if (writes.release && predict_dma_release && split.SemaphorePredict()) {
+    if (writes.release && predict_dma_release && split.SemaphorePredict() &&
+        VideoCommon::GpuSplit::PredictFenceReports()) {
         split.NoteRelease(&memory_manager, writes.release_address, writes.release_payload);
     }
 }
