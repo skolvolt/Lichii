@@ -648,7 +648,7 @@ void DmaPusher::NoteBackWrites(const BackWrites& writes) {
     auto& split = VideoCommon::GpuSplit::Get();
     for (u32 i = 0; i < writes.count; ++i) {
         const auto& [begin, end] = writes.ranges[i];
-        split.NoteWrite(&memory_manager, begin, end - begin);
+        split.NoteWrite(&memory_manager, begin, end - begin, false, 1);
     }
     if (writes.unbounded) {
         split.NoteUnboundedWrite(writes.writer, writes.cause);

@@ -382,10 +382,44 @@ public:
     /// The work just sent writes [address, address + size) of the GPU address space `space` (its
     /// MemoryManager) when the back runs it. `fine`: a release or report (tracked by the word, so
     /// reads of the words next to it don't wait for it); other writes are tracked by the page.
-    void NoteWrite(const void* space, GPUVAddr address, u64 size, bool fine = false) {
+    void NoteWrite(const void* space, GPUVAddr address, u64 size, bool fine = false,
+                   u8 nup_source = 0) {
         if (narrow && size != 0) {
             RecordWrite(space, address, size, fine);
+            if (nup_write_ring_on) [[unlikely]] {
+                nup_write_ring[nup_write_ring_next++ & 255] = {address, address + size, nup_source};
+            }
         }
+    }
+    /// nup EDEN_NX2_PREDICT_STATS: the last 256 recorded writes and their source (1 DMA copy,
+    /// 2 3D inline upload, 3 compute inline upload, 4 constant buffer words, 0 other).
+    struct NupWrite { GPUVAddr begin, end; u8 source; };
+    std::array<NupWrite, 256> nup_write_ring{};
+    u32 nup_write_ring_next{};
+    const bool nup_write_ring_on = true; // also used by QMD overlay patching (kepler_compute)
+    /// Whether every recorded write over [address, address + size) since ring index `since` was
+    /// exactly [begin, end) (false when the ring wrapped past it).
+    [[nodiscard]] bool NupOnlyWritesSince(u32 since, GPUVAddr address, u64 size, GPUVAddr begin,
+                                          GPUVAddr end) const {
+        if (nup_write_ring_next - since > 256) {
+            return false;
+        }
+        for (u32 i = since; i != nup_write_ring_next; ++i) {
+            const NupWrite& w = nup_write_ring[i & 255];
+            if (w.begin < address + size && address < w.end && (w.begin != begin || w.end != end)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    [[nodiscard]] int NupLastWriteSource(GPUVAddr address, u64 size) const {
+        for (u32 i = 0; i < 256; ++i) {
+            const NupWrite& w = nup_write_ring[(nup_write_ring_next - 1 - i) & 255];
+            if (w.begin < address + size && address < w.end) {
+                return w.source;
+            }
+        }
+        return -1;
     }
     /// The work just sent may write guest memory the front can't bound. `writer`: it is compute
     /// or copy work (what WaitForWriters waits for).
@@ -467,6 +501,10 @@ public:
     /// so far: the recorded writes over it and the unbounded writes that write guest memory
     /// (not BarrierOnly). Also refreshes ConsumedPosition.
     [[nodiscard]] u64 GuestReadTarget(const void* space, GPUVAddr address, u64 size);
+    /// nup: the recorded writes alone (no unbounded-writer floor), for wait statistics.
+    [[nodiscard]] u64 RecordedWriteTarget(const void* space, GPUVAddr address, u64 size) const {
+        return PendingWriteTarget(space, address, size, 0);
+    }
     /// What the back consumed, as last loaded.
     [[nodiscard]] u64 ConsumedPosition() const {
         return consumed_cache;

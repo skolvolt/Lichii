@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -68,7 +69,8 @@ struct FrontQmdMirror {
     NativeQmdScheduler::StateTable table;
     u64 session{~u64{0}};
     bool disabled{};
-    std::array<Overlay, MaxOverlays> overlays{};
+    // nup: by address (Ocarina writes ~110 QMDs a frame; 64 slots evicted them before their read).
+    std::unordered_map<GPUVAddr, Overlay> overlays;
     size_t next_overlay{};
     /// Reads in the current window, those that waited for queued writes, and resyncs.
     u32 window_reads{};
@@ -76,30 +78,150 @@ struct FrontQmdMirror {
     u32 window_resyncs{};
 
     const Overlay* FindOverlay(const void* space, GPUVAddr address) const {
-        for (const Overlay& overlay : overlays) {
-            if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
-                return &overlay;
+        const auto it = overlays.find(address);
+        return it != overlays.end() && it->second.position != 0 && it->second.space == space
+                   ? &it->second
+                   : nullptr;
+    }
+
+    // nup EDEN_NX2_QMD_UPLOAD_OVERLAY (default on, 0 = off): QMDs Ocarina writes with compute inline
+    // data uploads (not the inline-QMD method 0x107) become overlays too. The words of a linear,
+    // contiguous transfer are captured as the front queues them and turned into overlays for every
+    // whole 256-byte QMD they cover once the transfer's write is recorded, at that position. As with
+    // 0x107, an overlay is only used while no later recorded write covers the QMD.
+    bool capture_on = [] {
+        const char* v = std::getenv("EDEN_NX2_QMD_UPLOAD_OVERLAY");
+        return v == nullptr || v[0] != '0';
+    }();
+    bool capture_active{};
+    GPUVAddr capture_dst{};
+    u32 capture_size{};
+    std::vector<u32> capture_words;
+    struct HeldCapture {
+        GPUVAddr dst;
+        u32 size;
+        std::vector<u32> words;
+    };
+    std::vector<HeldCapture> held; ///< finished transfers waiting for their recorded write
+    u64 cap_evicted{}, cap_start{}, cap_unusable{}, cap_size{}, cap_range{}, cap_short{}, cap_done{}, cap_qmds{};
+    void CaptureStats() {
+        static const bool on = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        if (on && std::chrono::steady_clock::now() >= next) {
+            next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            LOG_INFO(HW_GPU, "nup QMD capture 10 s: {} transfers, {} not linear/contiguous, {} bad "
+                     "size, {} range mismatch at commit, {} short at commit, {} committed ({} QMDs), {} held evicted, {} patched",
+                     cap_start, cap_unusable, cap_size, cap_range, cap_short, cap_done, cap_qmds, cap_evicted, cap_patched);
+            cap_patched = 0;
+            cap_evicted = 0;
+            cap_start = cap_unusable = cap_size = cap_range = cap_short = cap_done = cap_qmds = 0;
+        }
+    }
+    void StartCapture(GPUVAddr dst, u32 size, bool usable) {
+        ++cap_start;
+        cap_unusable += usable ? 0 : 1;
+        cap_size += usable && !(size != 0 && size <= 64 * 1024 && (size & 3) == 0) ? 1 : 0;
+        CaptureStats();
+        // A finished transfer whose write is not recorded yet (macros hold data words until their
+        // run goes): keep it for its commit.
+        if (capture_active && capture_words.size() * sizeof(u32) >= capture_size) {
+            if (held.size() >= 1024) {
+                ++cap_evicted;
+                held.erase(held.begin());
+            }
+            held.push_back({capture_dst, capture_size, std::move(capture_words)});
+            capture_words = {};
+        }
+        capture_active = capture_on && usable && size != 0 && size <= 64 * 1024 && (size & 3) == 0;
+        capture_dst = dst;
+        capture_size = size;
+        capture_words.clear();
+    }
+    void CaptureWord(u32 word) {
+        if (capture_active) {
+            capture_words.push_back(word);
+        }
+    }
+    /// QMDs [begin, end) only partly covers whose overlay was current before the write (no recorded
+    /// write after the overlay's): the partial words patch it (games rewrite a few QMD fields).
+    std::array<GPUVAddr, 8> patchable{};
+    u32 patchable_count{};
+    GPUVAddr patch_begin{}, patch_end{};
+    u32 patch_ring_since{};
+    const VideoCommon::GpuSplit* patch_split{};
+    u64 cap_patched{};
+    void PatchPartial(const void* space, GPUVAddr dst, u32 size, const std::vector<u32>& words,
+                      u64 position) {
+        const GPUVAddr end = dst + size;
+        for (u32 i = 0; i < patchable_count; ++i) {
+            const GPUVAddr qmd = patchable[i];
+            const auto it = overlays.find(qmd);
+            if (it == overlays.end() || it->second.space != space) {
+                continue;
+            }
+            // Only this transfer's own records (its words may be recorded one at a time) since the
+            // overlay was found current.
+            if (patch_split == nullptr ||
+                !patch_split->NupOnlyWritesSince(patch_ring_since, qmd, 256, dst, end)) {
+                continue;
+            }
+            const GPUVAddr lo = (std::max)(qmd, dst);
+            const GPUVAddr hi = (std::min)(qmd + 256, end);
+            if (lo >= hi || ((lo - qmd) & 3) != 0 || ((hi - lo) & 3) != 0 || ((lo - dst) & 3) != 0) {
+                continue;
+            }
+            std::memcpy(reinterpret_cast<u8*>(it->second.words.data()) + (lo - qmd),
+                        words.data() + (lo - dst) / sizeof(u32), hi - lo);
+            it->second.position = position;
+            ++cap_patched;
+        }
+        patchable_count = 0;
+        patch_begin = patch_end = 0;
+    }
+    void CommitCapture(const void* space, GPUVAddr begin, GPUVAddr end, u64 position) {
+        if (!held.empty()) {
+            for (auto it = held.begin(); it != held.end(); ++it) {
+                if (it->dst == begin && it->dst + it->size == end) {
+                    ++cap_done;
+                    for (GPUVAddr qmd = Common::AlignUp(it->dst, 256); qmd + 256 <= end; qmd += 256) {
+                        AddOverlay(space, qmd, position, it->words.data() + (qmd - it->dst) / sizeof(u32));
+                        ++cap_qmds;
+                    }
+                    PatchPartial(space, it->dst, it->size, it->words, position);
+                    held.erase(it);
+                    return;
+                }
             }
         }
-        return nullptr;
+        if (!capture_active) {
+            return;
+        }
+        if (begin != capture_dst || end != capture_dst + capture_size) {
+            ++cap_range;
+            return;
+        }
+        if (capture_words.size() * sizeof(u32) < capture_size) {
+            ++cap_short;
+            return;
+        }
+        ++cap_done;
+        for (GPUVAddr qmd = Common::AlignUp(capture_dst, 256); qmd + 256 <= end; qmd += 256) {
+            AddOverlay(space, qmd, position, capture_words.data() + (qmd - capture_dst) / sizeof(u32));
+            ++cap_qmds;
+        }
+        PatchPartial(space, capture_dst, capture_size, capture_words, position);
+        capture_active = false;
     }
 
     void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words) {
-        Overlay* slot = nullptr;
-        for (Overlay& overlay : overlays) {
-            if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
-                slot = &overlay;
-                break;
-            }
+        if (overlays.size() >= 8192) {
+            overlays.clear(); // ponytail: wholesale reset; the cleared ones only cost a wait
         }
-        if (slot == nullptr) {
-            slot = &overlays[next_overlay];
-            next_overlay = (next_overlay + 1) % MaxOverlays;
-        }
-        slot->space = space;
-        slot->address = address;
-        slot->position = position;
-        std::memcpy(slot->words.data(), words, sizeof(slot->words));
+        Overlay& slot = overlays[address];
+        slot.space = space;
+        slot.address = address;
+        slot.position = position;
+        std::memcpy(slot.words.data(), words, sizeof(slot.words));
     }
 };
 FrontQmdMirror g_front_qmd;
@@ -1868,6 +1990,9 @@ void KeplerCompute::FrontQueueWrite(VideoCommon::GpuSplit& split, FrontState& fs
     constexpr u32 exec_upload_method = KEPLER_COMPUTE_REG_INDEX(exec_upload);
     constexpr u32 data_upload_method = KEPLER_COMPUTE_REG_INDEX(data_upload);
     constexpr u32 upload_method = KEPLER_COMPUTE_REG_INDEX(upload);
+    if (method == data_upload_method) {
+        g_front_qmd.CaptureWord(argument);
+    }
     // Narrow compute only: without it DmaPusher notes every memory-writing compute method as an
     // unbounded write at the position after the call, which held work would not have reached.
     if (!g_compute_fuse || !split.NarrowCompute() || method >= native_plain_methods.size()) {
@@ -2090,6 +2215,14 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
         fs.upload_linear = (fs.registers[exec_upload_method] & 1) != 0;
         fs.upload_copy_size = fs.registers[KEPLER_COMPUTE_REG_INDEX(upload.line_length_in)] *
                               fs.registers[KEPLER_COMPUTE_REG_INDEX(upload.line_count)];
+        {
+            Upload::Registers upload{};
+            std::memcpy(&upload, fs.registers.data() + KEPLER_COMPUTE_REG_INDEX(upload),
+                        sizeof(upload));
+            const bool contiguous = upload.line_count <= 1 || upload.dest.pitch == upload.line_length_in;
+            g_front_qmd.StartCapture(upload.dest.Address(), fs.upload_copy_size,
+                                     fs.upload_linear && contiguous);
+        }
         break;
     case data_upload_method: {
         if (!fs.upload_known) {
@@ -2100,7 +2233,36 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
         std::memcpy(&upload, fs.registers.data() + KEPLER_COMPUTE_REG_INDEX(upload),
                     sizeof(upload));
         const auto [begin, end] = Upload::WriteRange(upload, fs.upload_linear, fs.upload_copy_size);
-        split.NoteWrite(&memory_manager, begin, end - begin);
+        {
+            auto& mirror = g_front_qmd;
+            // Decided at the transfer's first record: its later per-word records must not count.
+            const bool same_transfer = mirror.patch_begin == begin && mirror.patch_end == end;
+            if (!same_transfer) {
+                mirror.patchable_count = 0;
+                mirror.patch_begin = begin;
+                mirror.patch_end = end;
+                mirror.patch_ring_since = split.nup_write_ring_next;
+                mirror.patch_split = &split;
+            }
+            const auto partial_check = [&](GPUVAddr qmd) {
+                if (qmd >= begin && qmd + 256 <= end) {
+                    return; // wholly covered: a new overlay
+                }
+                const auto* overlay = mirror.FindOverlay(&memory_manager, qmd);
+                if (overlay != nullptr && mirror.patchable_count < mirror.patchable.size() &&
+                    split.RecordedWriteTarget(&memory_manager, qmd, 256) <= overlay->position) {
+                    mirror.patchable[mirror.patchable_count++] = qmd;
+                }
+            };
+            if (!same_transfer) {
+                partial_check(Common::AlignDown(begin, 256));
+                if (Common::AlignDown(end - 1, 256) != Common::AlignDown(begin, 256)) {
+                    partial_check(Common::AlignDown(end - 1, 256));
+                }
+            }
+        }
+        split.NoteWrite(&memory_manager, begin, end - begin, false, 3);
+        g_front_qmd.CommitCapture(&memory_manager, begin, end, split.WritePosition());
         break;
     }
     default:
@@ -2202,8 +2364,61 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
             mirror.FindOverlay(&memory_manager, address);
         if (overlay != nullptr && overlay->position > consumed && target <= overlay->position) {
             descriptor = overlay->words;
+            // nup EDEN_NX2_QMD_OVERLAY_VERIFY: wait anyway and compare with guest memory.
+            static const bool verify = std::getenv("EDEN_NX2_QMD_OVERLAY_VERIFY") != nullptr;
+            if (verify) {
+                static u64 n_used, n_bad;
+                static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                split.WaitForGuestRead(target);
+                NativeQmdScheduler::Descriptor real{};
+                memory_manager.ReadBlockUnsafe(address, real.data(), size);
+                ++n_used;
+                if (real != descriptor) {
+                    ++n_bad;
+                    descriptor = real;
+                }
+                if (std::chrono::steady_clock::now() >= next) {
+                    next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                    LOG_INFO(HW_GPU, "nup QMD overlay verify 10 s: {} used, {} differed from memory",
+                             n_used, n_bad);
+                    n_used = n_bad = 0;
+                }
+            }
         } else {
             ++mirror.window_waits;
+            // nup EDEN_NX2_PREDICT_STATS: is the wait for a write recorded over the QMD, or only for
+            // the unbounded-writer floor (compute/copies whose writes the front can't bound)?
+            static const bool qmd_stats = std::getenv("EDEN_NX2_PREDICT_STATS") != nullptr;
+            if (qmd_stats) {
+                static u64 n_recorded, n_floor, n_overlay_old;
+                static std::array<u64, 6> by_source{};
+                ++by_source[static_cast<size_t>(split.NupLastWriteSource(address, size) + 1)];
+                static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                const u64 recorded = split.RecordedWriteTarget(&memory_manager, address, size);
+                if (recorded > consumed) {
+                    ++n_recorded;
+                } else {
+                    ++n_floor;
+                }
+                n_overlay_old += overlay != nullptr ? 1 : 0;
+                static u32 shown = 0;
+                if (overlay != nullptr && shown < 12) {
+                    ++shown;
+                    LOG_INFO(HW_GPU, "nup stale QMD overlay {:#x}: overlay pos {} target {} consumed {} "
+                             "write pos {} last ring writer {}", address, overlay->position, target,
+                             consumed, split.WritePosition(), split.NupLastWriteSource(address, size));
+                }
+                if (std::chrono::steady_clock::now() >= next) {
+                    next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                    LOG_INFO(HW_GPU, "nup QMD read waits 10 s: {} for a recorded write over it, {} only "
+                             "for the unbounded floor ({} with an older inline overlay); last writer "
+                             "not in ring {}, other {}, DMA copy {}, 3D inline {}, compute inline {}, "
+                             "cbuf {}", n_recorded, n_floor, n_overlay_old, by_source[0],
+                             by_source[1], by_source[2], by_source[3], by_source[4], by_source[5]);
+                    by_source = {};
+                    n_recorded = n_floor = n_overlay_old = 0;
+                }
+            }
             split.WaitForGuestRead(target);
             memory_manager.ReadBlockUnsafe(address, descriptor.data(), size);
         }

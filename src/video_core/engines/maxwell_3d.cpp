@@ -2056,7 +2056,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
                         address(MAXWELL3D_REG_INDEX(const_buffer.address_high),
                                 MAXWELL3D_REG_INDEX(const_buffer.address_low)) +
                             offset,
-                        bytes);
+                        bytes, false, 4);
         return;
     }
     switch (method) {
@@ -2068,7 +2068,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         Upload::Registers upload{};
         std::memcpy(&upload, fs.regs.data() + MAXWELL3D_REG_INDEX(upload), sizeof(upload));
         const auto [begin, end] = Upload::WriteRange(upload, fs.upload_linear, fs.upload_copy_size);
-        split.NoteWrite(&memory_manager, begin, end - begin);
+        split.NoteWrite(&memory_manager, begin, end - begin, false, 2);
         return;
     }
     case MAXWELL3D_REG_INDEX(report_semaphore.query): {
