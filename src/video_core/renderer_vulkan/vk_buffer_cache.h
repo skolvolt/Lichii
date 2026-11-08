@@ -340,6 +340,17 @@ private:
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+
+    /// The vertex buffer each binding last recorded, and the scheduler recording epoch it was
+    /// recorded at (~0: unknown).
+    struct BoundVertexBuffer {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkDeviceSize size = 0;
+        VkDeviceSize stride = 0;
+        u64 epoch = ~u64{0};
+    };
+    std::array<BoundVertexBuffer, VideoCommon::NUM_VERTEX_BUFFERS> bound_vertex_buffers{};
 };
 
 struct BufferCacheParams {

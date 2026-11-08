@@ -728,6 +728,9 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
     if (index >= device.GetMaxVertexInputBindings()) {
         return;
     }
+    if (index < bound_vertex_buffers.size()) {
+        bound_vertex_buffers[index].epoch = ~u64{0};
+    }
     if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
         const auto repacked =
             vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
@@ -797,6 +800,25 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     const u32 binding_count = max_binding - min_binding;
     if (binding_count == 0) {
         return;
+    }
+    // The same buffers are still bound in this command buffer (as for index buffers): skip the
+    // rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged registers.
+    if (!VideoCommon::Nx2Perf::Verify()) {
+        const u64 epoch = scheduler.RecordingEpoch();
+        bool unchanged = true;
+        for (u32 i = 0; unchanged && i < binding_count; ++i) {
+            const BoundVertexBuffer& bound = bound_vertex_buffers[min_binding + i];
+            unchanged = bound.epoch == epoch && bound.buffer == buffer_handles[i] &&
+                        bound.offset == bindings.offsets[i] && bound.size == bindings.sizes[i] &&
+                        bound.stride == bindings.strides[i];
+        }
+        if (unchanged) {
+            return;
+        }
+        for (u32 i = 0; i < binding_count; ++i) {
+            bound_vertex_buffers[min_binding + i] = {buffer_handles[i], bindings.offsets[i],
+                                                     bindings.sizes[i], bindings.strides[i], epoch};
+        }
     }
     // Most draws bind a few streams: record only those. The full HostBindings is ~1.3 KiB of
     // the scheduler's 32 KiB command chunk on every draw that rebinds vertex buffers.
