@@ -12,8 +12,12 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <chrono>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <string_view>
+#include <unordered_set>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -302,6 +306,13 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
 
 void Maxwell3D::RefreshParametersImpl() {
     if (!Settings::IsGPULevelHigh()) {
+        return;
+    }
+    // Macro parameters are command-list words. With DMA accuracy Unsafe the owner has chosen not
+    // to flush command-list reads, and GPU-written lists already come from the GPU's copy
+    // (DmaPusher::ReadGpuWrittenCommands), so this flushing re-read only adds a full GPU wait per
+    // macro call (Ocarina, accurate GPU: ~21% of the GPU thread blocked here). Same as low accuracy.
+    if (!Settings::IsDMALevelDefault() && !Settings::IsDMALevelSafe()) {
         return;
     }
     size_t current_index = 0;

@@ -1847,6 +1847,34 @@ private:
             }
             m_frame_trace.last_present = entered;
         }
+        // EDEN_NX2_FRAME_TIMES=<file.csv>: one line per present, for finding what a short hitch
+        // is made of (the 600-present stats below average it away). game_ms is the time since
+        // the previous present returned (guest CPU work for this frame); fence_ms is the wait for
+        // Eden's GPU thread. t_ms is steady_clock milliseconds, as in the pipeline build trace.
+        {
+            static std::FILE* const frame_times = [] {
+                const char* const path = std::getenv("EDEN_NX2_FRAME_TIMES");
+                std::FILE* const f = path != nullptr && *path != '\0' ? std::fopen(path, "w") : nullptr;
+                if (f != nullptr) {
+                    std::fputs("t_ms,frame_ms,game_ms,fence_ms,composite_ms,pace_ms\n", f);
+                }
+                return f;
+            }();
+            if (frame_times != nullptr) {
+                const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+                if (m_frame_times_last_entered != std::chrono::steady_clock::time_point{}) {
+                    std::fprintf(frame_times, "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                                 ms(entered.time_since_epoch()), ms(entered - m_frame_times_last_entered),
+                                 ms(entered - m_frame_times_last_paced), ms(waited - entered),
+                                 ms(composited - waited), ms(paced - composited));
+                    if ((m_presents % 60) == 0) {
+                        std::fflush(frame_times);
+                    }
+                }
+                m_frame_times_last_entered = entered;
+                m_frame_times_last_paced = paced;
+            }
+        }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
@@ -1893,6 +1921,7 @@ private:
     // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
     // rewrites command memory it hasn't read yet.
     u32 m_wait_timeouts{};
+    std::chrono::steady_clock::time_point m_frame_times_last_entered{}, m_frame_times_last_paced{};
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
@@ -2650,6 +2679,11 @@ private:
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
+    // Movie pacing (see DropOvertakenFrames): a longer gap between acquires is a pause, a longer
+    // lag a jump in the stream; both restart the clock instead of dropping frames.
+    static constexpr s64 PauseGap = 1'000'000;   // us
+    static constexpr s64 MaxCatchUp = 3'000'000; // us
+    static constexpr u32 MaxDroppedInARow = 30;
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2732,6 +2766,8 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
+            m_clock_offset.reset();
+            m_stream_start.reset();
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2847,6 +2883,25 @@ private:
         const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
         const bool end = (w[words + 2] & 0xFF) != 0;
         Log(ctx, "submit");
+        // The SDK answers busy when the decoder cannot take a packet, and the client retries after
+        // the submission-ready event. Taking every packet let a player queue a whole movie: Ocarina
+        // of Time's title movie went in at ~330 packets a second (2,600 queued), and until the
+        // last was in, its pictures came at 20-28 fps, so the video started ~11 s behind its
+        // audio. End of stream is never refused.
+        if (!end) {
+            std::scoped_lock lk{m_mutex};
+            if (m_inputs.Full()) {
+                if (Nx2VideoTraceEnabled()) {
+                    LOG_INFO(Service, "nx2:vdec trace refuse syncpoint={} pts={} queued={}",
+                             m_syncpoint, pts, m_inputs.Size());
+                }
+                // nn::codec's module (111) is HwOpus in ErrorModule
+                constexpr Result ResultDecoderBusy{ErrorModule::HwOpus, 3603};
+                IPC::ResponseBuilder rb{ctx, 2};
+                rb.PushRaw<u32>(ResultDecoderBusy.raw);
+                return;
+            }
+        }
         Input input{{}, pts, end};
         if (!ctx.BufferDescriptorA().empty()) {
             const auto data = ctx.ReadBufferA(0);
@@ -2893,6 +2948,8 @@ private:
             m_flush = true;
             m_stream_ended = false;
             m_end_queued = false;
+            m_clock_offset.reset();
+            m_stream_start.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
@@ -2917,8 +2974,77 @@ private:
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
             CompleteHandedFences();
+            m_clock_offset.reset();
+            m_stream_start.reset();
         }
         TipcReplyWords(ctx, {});
+    }
+
+    s64 HostTimeUs() const {
+        return system.CoreTiming().GetGlobalTimeUs().count();
+    }
+
+    // Whether emulation was paused and resumed after host time `time_us`: the movie's audio
+    // stopped meanwhile, so the clock must restart from the next acquire.
+    bool ResumedSince(s64 time_us) const {
+        return system.CoreTiming().GetPauseEndTime().count() / 1000 > time_us;
+    }
+
+    // Starts or corrects the movie clock from a frame the client just acquired (m_mutex held).
+    // The clock never runs behind a frame the client already shows.
+    void AnchorClock(u64 pts) {
+        const s64 now = HostTimeUs();
+        const s64 offset = now - static_cast<s64>(pts);
+        if (!m_clock_offset || now - m_last_acquire > PauseGap || ResumedSince(m_last_acquire) ||
+            pts < m_last_acquired_pts || offset < *m_clock_offset ||
+            offset - *m_clock_offset > MaxCatchUp) {
+            m_clock_offset = offset;
+        }
+        m_last_acquire = now;
+        m_last_acquired_pts = pts;
+    }
+
+    // The pts the movie's audio has reached, if the client shows frames yet (m_mutex held).
+    std::optional<u64> DuePts() {
+        if (!m_clock_offset) {
+            return std::nullopt;
+        }
+        const s64 now = HostTimeUs();
+        const s64 due = now - *m_clock_offset;
+        // Nothing acquired for a while: paused; the next acquire restarts the clock.
+        if (due < 0 || now - m_last_acquire > PauseGap || ResumedSince(m_last_acquire)) {
+            return std::nullopt;
+        }
+        return static_cast<u64>(due);
+    }
+
+    // Games such as Ocarina of Time show one decoded frame per frame they draw and never skip
+    // one, while the movie's audio plays in real time: below the movie's frame rate the picture
+    // falls further behind the sound. Drop decoded frames a later frame has already overtaken
+    // (m_mutex held). Returns true when the only frame left is late and more input is queued:
+    // decode on before filling an image.
+    bool DropOvertakenFrames() {
+        if (m_decoded.empty()) {
+            return false;
+        }
+        const auto due = DuePts();
+        if (!due) {
+            m_dropped_in_a_row = 0;
+            return false;
+        }
+        while (m_decoded.size() >= 2 && m_dropped_in_a_row < MaxDroppedInARow) {
+            const Decoded& front = m_decoded[0];
+            const Decoded& next = m_decoded[1];
+            if (front.end || !front.picture || next.pts <= front.pts || next.pts > *due) {
+                break;
+            }
+            m_decoded.pop_front();
+            ++m_frames_dropped;
+            ++m_dropped_in_a_row;
+        }
+        const Decoded& front = m_decoded.front();
+        return m_decoded.size() == 1 && !m_inputs.Empty() && !front.end &&
+               m_dropped_in_a_row < MaxDroppedInARow && front.pts + m_frame_interval < *due;
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -2947,6 +3073,7 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+                AnchorClock(output->pts);
             }
         }
         if (!output) {
@@ -2990,6 +3117,8 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                m_last_decoded_pts = 0;
+                m_dropped_in_a_row = 0;
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -2997,7 +3126,8 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty()) {
+            if (!m_decoded.empty() && !m_free.empty() && !DropOvertakenFrames()) {
+                m_dropped_in_a_row = 0;
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
                 const u32 image = m_free.front();
@@ -3027,10 +3157,24 @@ private:
                     DrainFreeAsEndOfStream();
                 }
                 ++m_frames_out;
+                const s64 written_us = HostTimeUs();
+                if (!m_stream_start) {
+                    m_stream_start = {written_us, frame.pts};
+                }
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
-                    LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
+                    // How far the frames written lag their timestamps since the stream's first.
+                    const s64 behind_us =
+                        (written_us - m_stream_start->first) -
+                        (static_cast<s64>(frame.pts) - static_cast<s64>(m_stream_start->second));
+                    LOG_INFO(Service,
+                             "{} frame {} ({}x{}, pts {} us{}) in image {}, {} late dropped, "
+                             "{} ms behind",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
-                             frame.end ? ", end of stream" : "", image);
+                             frame.end ? ", end of stream" : "", image, m_frames_dropped,
+                             behind_us / 1000);
+                }
+                if (frame.end) {
+                    m_stream_start.reset();
                 }
                 continue;
             }
@@ -3076,6 +3220,10 @@ private:
             }
             for (auto& picture : pictures) {
                 const u64 pts = picture.pts;
+                if (pts > m_last_decoded_pts && pts - m_last_decoded_pts <= 100'000) {
+                    m_frame_interval = pts - m_last_decoded_pts;
+                }
+                m_last_decoded_pts = pts;
                 m_decoded.push_back({std::move(picture), pts, false});
             }
             if (input.end) {
@@ -3265,6 +3413,14 @@ private:
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
     u64 m_decoded_frames{};
+    u64 m_frames_dropped{};
+    std::optional<s64> m_clock_offset; ///< Host time minus pts (us) of the frames the client shows
+    s64 m_last_acquire{};              ///< Host time (us) of the client's last acquire
+    u64 m_last_acquired_pts{};
+    u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
+    u64 m_last_decoded_pts{};
+    u32 m_dropped_in_a_row{};
+    std::optional<std::pair<s64, u64>> m_stream_start; ///< Host time (us) and pts of its first frame
     Nx2VideoInputQueue m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them

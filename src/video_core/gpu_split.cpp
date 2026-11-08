@@ -184,7 +184,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // mid-game: hand the engines back to the front (and start again when they allow it).
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
-    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
+    // Accurate GPU touches back-owned caches from the front through flushing command reads,
+    // the macro parameter refresh (both off with DMA accuracy Unsafe: safe_reads is false and
+    // Maxwell3D::RefreshParametersImpl returns early) and delayed fences (off with fence behavior
+    // Immediate). With all three off, accurate GPU can split like low accuracy. Check a change
+    // here with EDEN_NX2_SPLIT_CHECK=1.
+    const bool delayed_fences = Settings::IsGPUFenceBehaviorDefault()
+                                    ? Settings::IsGPULevelHigh()
+                                    : Settings::IsGPUFenceBehaviorBalanced() ||
+                                          Settings::IsGPUFenceBehaviorAccurate();
+    const bool allowed = !safe_reads && (!Settings::IsGPULevelHigh() || !delayed_fences) &&
                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
     if (active && !allowed) {
         Drain();

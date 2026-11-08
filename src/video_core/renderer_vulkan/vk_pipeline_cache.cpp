@@ -1415,11 +1415,23 @@ void PipelineCache::EvictUnusedPipelines() {
     if (device.IsMoltenVK()) {
         return;
     }
+    // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
+    // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
+    // one by one in new places).
+    if (PreloadAllPipelines()) {
+        return;
+    }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // EDEN_NX2_PIPELINE_EVICT_FRAMES=<frames> overrides the age; 0 never evicts. Ocarina keeps
+    // ~1,700 pipelines (~0.8 GB): evicting 961 at once stalled the GPU thread ~300 ms, and the
+    // evicted ones are rebuilt when the player returns. A desktop can keep them all.
+    static const u64 EvictAfterFrames = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIPELINE_EVICT_FRAMES");
+        return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : u64{9000};
+    }();
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -2250,9 +2262,21 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         file.read(cache_data.data(), cache_size);
 
         LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+                 "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
-        return create_pipeline_cache(cache_size, cache_data.data());
+        try {
+            return create_pipeline_cache(cache_size, cache_data.data());
+        } catch (const vk::Exception& e) {
+            // The blob came from another driver or driver version (e.g. switching between
+            // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of
+            // aborting, and drop the stale file so the next run doesn't retry it.
+            LOG_ERROR(Render_Vulkan,
+                      "Driver rejected the Vulkan pipeline cache file ({}), starting with an empty "
+                      "cache and deleting it",
+                      e.what());
+            Common::FS::RemoveFile(filename);
+            return create_pipeline_cache(0, nullptr);
+        }
 
     } catch (const std::ios_base::failure& e) {
         LOG_ERROR(Common_Filesystem, "{}", e.what());

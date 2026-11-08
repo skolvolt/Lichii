@@ -3,6 +3,7 @@
 
 // Static Qt on macOS doesn't use Vulkan
 // Other platforms do, and thus have conflicting VulkanMemoryAllocator symbols
+#include <cstdlib>
 #include "core/launch_params.h"
 #if defined(QT_STATICPLUGIN) && !defined(__APPLE__)
 #undef VMA_IMPLEMENTATION

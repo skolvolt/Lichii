@@ -466,6 +466,8 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+        LOG_INFO(HW_GPU, "nup: {} render targets relocated in 600 frames", nup_relocated);
+        nup_relocated = 0;
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
@@ -3155,6 +3157,157 @@ template <class P>
 ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
     ImageInfo new_info = info;
     const size_t size_bytes = CalculateGuestSizeInBytes(new_info);
+    // nup EDEN_NX2_RT_RELOCATE=1: a render target of the same shape as one the game drew into
+    // before but not this frame, placed overlapping it at another address (Ocarina's transient
+    // allocator shifts its targets every frame), takes that image over: moved to the new address,
+    // no new image, no upload or alias copies. Transient targets' contents are undefined until
+    // the game clears or draws them, as the stale guest memory uploaded before was.
+    // ponytail: overlap-only search; targets that move further than their own size are not caught.
+    // 1 = only targets the current clear overwrites whole (no stale contents can show);
+    // 2 = every moved target of the same shape (faster; old contents may flash through).
+    static const int nup_relocate = [] {
+        const char* v = std::getenv("EDEN_NX2_RT_RELOCATE");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    const auto nup_cleared_whole = [&] {
+        if (!clearing_render_targets || !join_copies_to_do.empty() ||
+            new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
+            new_info.resources.layers != 1 || new_info.num_samples != 1) {
+            return false;
+        }
+        const auto& regs = maxwell3d->regs;
+        const auto& surface = regs.clear_surface;
+        if (surface.layer != 0) {
+            return false;
+        }
+        const u32 width = new_info.size.width;
+        const u32 height = new_info.size.height;
+        if (!ClearCovers(width, height)) {
+            return false;
+        }
+        // The clear covers the framebuffer's render area, the smallest bound target.
+        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+            const auto& rt = regs.rt[index];
+            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+                (rt.width < width || rt.height < height)) {
+                return false;
+            }
+        }
+        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+            (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
+            return false;
+        }
+        const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+        const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
+        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
+        case VideoCore::Surface::SurfaceType::ColorTexture: {
+            // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
+            const u32 index = surface.RT;
+            return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
+                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+                   regs.rt[index].Address() == gpu_addr;
+        }
+        case VideoCore::Surface::SurfaceType::Depth:
+            return is_depth_target && surface.Z;
+        case VideoCore::Surface::SurfaceType::Stencil:
+            return is_depth_target && full_stencil;
+        case VideoCore::Surface::SurfaceType::DepthStencil:
+            return is_depth_target && surface.Z && full_stencil;
+        default:
+            return false;
+        }
+    };
+    if (nup_relocate > 0 && clearing_render_targets_lookup &&
+        (nup_relocate >= 2 || nup_cleared_whole())) { // nup: only targets this clear overwrites whole
+        const auto same_shape = [&](const ImageInfo& a) {
+            return a.format == new_info.format && a.type == new_info.type &&
+                   a.size.width == new_info.size.width && a.size.height == new_info.size.height &&
+                   a.size.depth == new_info.size.depth &&
+                   a.resources.levels == new_info.resources.levels &&
+                   a.resources.layers == new_info.resources.layers &&
+                   a.block.width == new_info.block.width && a.block.height == new_info.block.height &&
+                   a.block.depth == new_info.block.depth && a.num_samples == new_info.num_samples &&
+                   a.tile_width_spacing == new_info.tile_width_spacing &&
+                   a.layer_stride == new_info.layer_stride && a.pitch == new_info.pitch &&
+                   a.native_tiling == new_info.native_tiling;
+        };
+        ImageId reuse_id{};
+        ForEachImageInRegion(cpu_addr, size_bytes, [&](ImageId id, ImageBase& image) {
+            if (reuse_id || !same_shape(image.info) || image.gpu_addr == gpu_addr ||
+                False(image.flags & ImageFlagBits::GpuModified) ||
+                True(image.flags & (ImageFlagBits::Remapped | ImageFlagBits::Sparse |
+                                    ImageFlagBits::IsDecoding | ImageFlagBits::Rescaled)) ||
+                lru_cache.Tick(image.lru_index) >= frame_tick) {
+                return;
+            }
+            reuse_id = id;
+        });
+        if (reuse_id) {
+            Image& image = slot_images[reuse_id];
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, reuse_id);
+            }
+            UnregisterImage(reuse_id);
+            total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
+            // Out of its old allocation group (InsertImage adds it to the new address's).
+            const auto alloc_it = image_allocs_table.find(image.gpu_addr);
+            if (alloc_it != image_allocs_table.end()) {
+                const ImageAllocId alloc_id = alloc_it->second;
+                auto& alloc_images = slot_image_allocs[alloc_id].images;
+                std::erase(alloc_images, reuse_id);
+                if (alloc_images.empty()) {
+                    image_allocs_table.erase(alloc_it);
+                    slot_image_allocs.erase(alloc_id);
+                }
+            }
+            for (const AliasedImage& alias : image.aliased_images) {
+                ImageBase& other = slot_images[alias.id];
+                std::erase_if(other.aliased_images,
+                              [reuse_id](const AliasedImage& a) { return a.id == reuse_id; });
+                other.CheckAliasState();
+            }
+            for (const ImageId overlap_id : image.overlapping_images) {
+                ImageBase& other = slot_images[overlap_id];
+                std::erase(other.overlapping_images, reuse_id);
+                other.CheckBadOverlapState();
+            }
+            image.aliased_images.clear();
+            image.overlapping_images.clear();
+            image.CheckAliasState();
+            image.CheckBadOverlapState();
+            // Views and framebuffers carry the old address in their lookups: drop them, as a
+            // deletion does; the image itself (and its memory) stays.
+            auto& dirty = maxwell3d->dirty.flags;
+            dirty[Dirty::RenderTargets] = true;
+            dirty[Dirty::ZetaBuffer] = true;
+            for (size_t rt = 0; rt < NUM_RT; ++rt) {
+                dirty[Dirty::ColorBuffer0 + rt] = true;
+            }
+            const std::vector<ImageViewId> view_ids = image.image_view_ids;
+            for (const ImageViewId view_id : view_ids) {
+                std::ranges::replace(render_targets.color_buffer_ids, view_id, ImageViewId{});
+                if (render_targets.depth_buffer_id == view_id) {
+                    render_targets.depth_buffer_id = ImageViewId{};
+                }
+            }
+            RemoveImageViewReferences(view_ids);
+            RemoveFramebuffers(view_ids);
+            for (const ImageViewId view_id : view_ids) {
+                sentenced_image_view.Push(std::move(slot_image_views[view_id]));
+                slot_image_views.erase(view_id);
+            }
+            image.image_view_ids.clear();
+            image.image_view_infos.clear();
+            image.gpu_addr = gpu_addr;
+            image.cpu_addr = cpu_addr;
+            image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
+            image.flags &= ~ImageFlagBits::CpuModified;
+            RegisterImage(reuse_id);
+            TrackImage(image, reuse_id);
+            ++nup_relocated;
+            return reuse_id;
+        }
+    }
     const bool broken_views = runtime.HasBrokenTextureViewFormats();
     const bool native_bgr = runtime.HasNativeBgr();
     join_overlap_ids.clear();
@@ -3725,6 +3878,10 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
                   info.size.height, info.resources.layers, gpu_addr);
         return ImageViewId{};
     }
+    clearing_render_targets_lookup = true; // nup: lets JoinImages relocate a moved target
+    SCOPE_EXIT {
+        clearing_render_targets_lookup = false;
+    };
     ImageId image_id{};
     bool delete_state = has_deleted_images;
     do {
