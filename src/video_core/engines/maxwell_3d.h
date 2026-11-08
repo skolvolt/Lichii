@@ -3408,6 +3408,10 @@ private:
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
     }
     void DumpRecentWrites(u32 method);
+    // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't
+    // model). Read per engine, not at static initialization, which runs before the frontend
+    // loads nx2_switches.txt.
+    const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
 

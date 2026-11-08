@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 
 namespace {
 using namespace Shader;
@@ -256,4 +258,23 @@ TEST_CASE("Mesh fallback distribution pass binds its buffers and constants",
                inst.operands.size() == 1 + sizeof(SPIRV::MeshEmulationDistributionConstants) / 4;
     })};
     REQUIRE(has_constants);
+}
+
+TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor set limit",
+          "[video_core][mesh_fallback]") {
+    using Vulkan::FitsStorageBufferSetLimit;
+
+    // Ordinary graphics pipelines do not add emulation descriptors.
+    REQUIRE(FitsStorageBufferSetLimit(8, 0, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(9, 0, 8));
+
+    // Mesh only: one output buffer. Task+mesh: four auxiliary bindings.
+    REQUIRE(FitsStorageBufferSetLimit(7, 1, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(8, 1, 8));
+    REQUIRE(FitsStorageBufferSetLimit(4, 4, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(5, 4, 8));
+
+    // No limit is represented by zero. Reject huge inputs without addition overflow.
+    REQUIRE(FitsStorageBufferSetLimit(200, 4, 0));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
 }

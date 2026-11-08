@@ -42,6 +42,7 @@
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
@@ -82,7 +83,7 @@ using VideoCommon::GraphicsEnvironment;
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
-constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
+constexpr auto& VULKAN_CACHE_MAGIC_NUMBER = VideoCommon::VulkanDriverPipelineCacheMagic;
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -1007,14 +1008,27 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
-    constexpr std::array<char, 8> shader_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-    VideoCommon::CopyCompatiblePipelineCache(
-        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", 52), pipeline_cache_filename,
-        shader_magic, 52, CACHE_VERSION);
-    std::error_code migration_error;
-    std::filesystem::copy_file(VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", 52),
-                               used_pipelines_filename, std::filesystem::copy_options::none,
-                               migration_error);
+    const auto carried = VideoCommon::CarryOverPipelineCache(
+        base_dir, "vulkan", VideoCommon::PipelineCacheMagic,
+        VideoCommon::CompatibleVulkanPipelineCacheVersions, CACHE_VERSION);
+    if (carried.version) {
+        // The used list goes with the pipelines it was saved beside, never one this version kept
+        // after its own cache was removed.
+        const auto carried_used =
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", *carried.version);
+        std::error_code migration_error;
+        if (std::filesystem::exists(carried_used, migration_error)) {
+            std::filesystem::copy_file(carried_used, used_pipelines_filename,
+                                       std::filesystem::copy_options::overwrite_existing,
+                                       migration_error);
+        } else {
+            std::filesystem::remove(used_pipelines_filename, migration_error);
+        }
+        LOG_INFO(Render_Vulkan, "Pipeline cache started from the version {} cache",
+                 *carried.version);
+    } else if (carried.failed) {
+        LOG_WARNING(Render_Vulkan, "Couldn't copy the older pipeline cache; this one starts empty");
+    }
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
@@ -1024,9 +1038,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
             VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", CACHE_VERSION);
-        VideoCommon::CopyCompatiblePipelineCache(
-            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", 52),
-            vulkan_pipeline_cache_filename, VULKAN_CACHE_MAGIC_NUMBER, 52, CACHE_VERSION);
+        if (VideoCommon::CarryOverPipelineCache(
+                base_dir, "vulkan_pipelines", VULKAN_CACHE_MAGIC_NUMBER,
+                VideoCommon::CompatibleVulkanPipelineCacheVersions, CACHE_VERSION)
+                .failed) {
+            LOG_WARNING(Render_Vulkan,
+                        "Couldn't copy the older driver pipeline cache; this one starts empty");
+        }
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
@@ -1811,10 +1829,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     Shader::NumDescriptors(programs[index].info.storage_buffers_descriptors);
             }
         }
-        if (storage_buffers > set_limit) {
+        // The fallback binds its output buffer (and, for task draws, payload,
+        // offsets and indirect arguments) into the same descriptor set.
+        const size_t auxiliary_buffers{
+            mesh_emulation ? (mesh_emulation->has_task ? 4U : 1U) : 0U};
+        if (!FitsStorageBufferSetLimit(storage_buffers, auxiliary_buffers, set_limit)) {
             throw Shader::NotImplementedException(
-                "Binding {} storage buffers to a pipeline whose descriptor set binds {}",
-                storage_buffers, set_limit);
+                "Binding {} storage buffers ({} for mesh fallback) to a descriptor set limited to {}",
+                storage_buffers + auxiliary_buffers, auxiliary_buffers, set_limit);
         }
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};

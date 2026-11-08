@@ -185,6 +185,136 @@ TEST_CASE("Compatible pipeline cache migration retries after an interrupted temp
     REQUIRE(ReadAll(old) == before);
 }
 
+TEST_CASE("A new cache version starts from the newest compatible cache on disk",
+          "[pipeline_cache_files][carry_over]") {
+    TempDir temp;
+    const auto v52 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 52);
+    const auto v53 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto v54 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 54);
+    WriteCache(v52, Magic, 52, "older pipelines");
+    WriteCache(v53, Magic, 53, "newer pipelines");
+    const auto before_v52 = ReadAll(v52);
+    const auto before_v53 = ReadAll(v53);
+    constexpr std::array<u32, 2> versions{53, 52};
+    const auto carried =
+        VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54);
+    REQUIRE(carried.version == 53u);
+    REQUIRE_FALSE(carried.failed);
+    REQUIRE(VideoCommon::PipelineCacheHeaderMatches(v54, Magic, 54));
+    REQUIRE(ReadAll(v54).substr(12) == "newer pipelines");
+    REQUIRE(ReadAll(v52) == before_v52);
+    REQUIRE(ReadAll(v53) == before_v53);
+    // A cache of its own version is never replaced, even when an older one changes later.
+    WriteCache(v53, Magic, 53, "written by the older build since");
+    const auto again =
+        VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54);
+    REQUIRE_FALSE(again.version);
+    REQUIRE_FALSE(again.failed);
+    REQUIRE(ReadAll(v54).substr(12) == "newer pipelines");
+}
+
+TEST_CASE("A new cache version skips an older file that isn't its cache",
+          "[pipeline_cache_files][carry_over]") {
+    TempDir temp;
+    constexpr std::array<u32, 2> versions{53, 52};
+    WriteCache(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53), OtherMagic, 53,
+               "another cache");
+    WriteCache(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 52), Magic, 52,
+               "older pipelines");
+    REQUIRE(VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54).version ==
+            52u);
+    REQUIRE(ReadAll(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 54)).substr(12) ==
+            "older pipelines");
+}
+
+TEST_CASE("A newer cache that can't be copied doesn't make way for an older one",
+          "[pipeline_cache_files][carry_over]") {
+    TempDir temp;
+    constexpr std::array<u32, 2> versions{53, 52};
+    const auto v54 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 54);
+    WriteCache(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53), Magic, 53,
+               "newer pipelines");
+    WriteCache(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 52), Magic, 52,
+               "older pipelines");
+    // A directory where the copy goes makes it fail.
+    auto temporary = v54;
+    temporary += ".migrating";
+    std::filesystem::create_directory(temporary);
+    const auto carried =
+        VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54);
+    REQUIRE(carried.failed);
+    REQUIRE_FALSE(carried.version);
+    REQUIRE_FALSE(std::filesystem::exists(v54));
+}
+
+TEST_CASE("A new cache version without a compatible cache starts empty",
+          "[pipeline_cache_files][carry_over]") {
+    TempDir temp;
+    constexpr std::array<u32, 2> versions{53, 52};
+    WriteCache(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 51), Magic, 51,
+               "another record layout");
+    const auto carried =
+        VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54);
+    REQUIRE_FALSE(carried.version);
+    REQUIRE_FALSE(carried.failed);
+    REQUIRE_FALSE(
+        std::filesystem::exists(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 54)));
+}
+
+TEST_CASE("The current Vulkan cache starts from the newest version it lists",
+          "[pipeline_cache_files][carry_over]") {
+    const std::span<const u32> versions{VideoCommon::CompatibleVulkanPipelineCacheVersions};
+    if (versions.empty()) {
+        return;
+    }
+    TempDir temp;
+    WriteCache(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", versions.front()),
+               Magic, versions.front(), "pipelines");
+    const auto carried =
+        VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", VideoCommon::PipelineCacheMagic,
+                                            versions, VideoCommon::VulkanPipelineCacheVersion);
+    REQUIRE(carried.version == versions.front());
+    REQUIRE(VideoCommon::PipelineCacheHeaderMatches(
+        VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan",
+                                                VideoCommon::VulkanPipelineCacheVersion),
+        VideoCommon::PipelineCacheMagic, VideoCommon::VulkanPipelineCacheVersion));
+}
+
+TEST_CASE("A cleared cache stays empty while an older cache could replace it",
+          "[pipeline_cache_files][carry_over]") {
+    TempDir temp;
+    constexpr std::array<u32, 2> versions{53, 52};
+    const auto v53 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto v54 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 54);
+    WriteCache(v53, Magic, 53, "pipelines");
+    const auto before_v53 = ReadAll(v53);
+    REQUIRE(VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54).version);
+    REQUIRE(VideoCommon::ClearPipelineCache(temp.path, "vulkan", Magic, versions, 54) ==
+            VideoCommon::PipelineCacheClear::Cleared);
+    REQUIRE(ReadAll(v54).size() == 12);
+    REQUIRE(VideoCommon::PipelineCacheHeaderMatches(v54, Magic, 54));
+    REQUIRE(ReadAll(v53) == before_v53);
+    const auto carried =
+        VideoCommon::CarryOverPipelineCache(temp.path, "vulkan", Magic, versions, 54);
+    REQUIRE_FALSE(carried.version);
+    REQUIRE_FALSE(carried.failed);
+    REQUIRE(ReadAll(v54).size() == 12);
+}
+
+TEST_CASE("A cleared cache without an older one is removed", "[pipeline_cache_files][carry_over]") {
+    TempDir temp;
+    constexpr std::array<u32, 2> versions{53, 52};
+    const auto v54 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 54);
+    REQUIRE(VideoCommon::ClearPipelineCache(temp.path, "vulkan", Magic, versions, 54) ==
+            VideoCommon::PipelineCacheClear::Missing);
+    WriteCache(v54, Magic, 54, "pipelines");
+    REQUIRE(VideoCommon::ClearPipelineCache(temp.path, "vulkan", Magic, versions, 54) ==
+            VideoCommon::PipelineCacheClear::Cleared);
+    REQUIRE_FALSE(std::filesystem::exists(v54));
+    REQUIRE(VideoCommon::ClearPipelineCache(temp.path, "vulkan", Magic, versions, 54) ==
+            VideoCommon::PipelineCacheClear::Missing);
+}
+
 TEST_CASE("Truncated mesh state is rejected before a pipeline can be queued",
           "[pipeline_cache_files][mesh_serialization]") {
     TempDir temp;
