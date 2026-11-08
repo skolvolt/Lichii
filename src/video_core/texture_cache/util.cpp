@@ -1444,6 +1444,37 @@ Extent3D MipBlockSize(const ImageInfo& info, u32 level) {
     return AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
 }
 
+bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                           std::span<const ImageCopy> copies) {
+    constexpr ImageFlagBits excluded = ImageFlagBits::Rescaled | ImageFlagBits::TrimmedLevels |
+                                       ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse |
+                                       ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles;
+    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D ||
+        src.info.format != dst.info.format || src.info.astc_opaque != dst.info.astc_opaque ||
+        True((src.flags | dst.flags) & excluded)) {
+        return false;
+    }
+    // Alias copies count a compressed extent in blocks, but the backends copy it as texels, so
+    // such a copy writes only part of the image.
+    if (DefaultBlockWidth(dst.info.format) != 1 || DefaultBlockHeight(dst.info.format) != 1) {
+        return false;
+    }
+    for (s32 level = 0; level < dst.info.resources.levels; ++level) {
+        const Extent3D size = MipSize(dst.info.size, level);
+        const bool covered = std::ranges::any_of(copies, [&](const ImageCopy& copy) {
+            return copy.dst_subresource.base_level == level &&
+                   copy.dst_subresource.base_layer == 0 &&
+                   copy.dst_subresource.num_layers >= dst.info.resources.layers &&
+                   copy.dst_offset == Offset3D{} && copy.extent.width >= size.width &&
+                   copy.extent.height >= size.height;
+        });
+        if (!covered) {
+            return false;
+        }
+    }
+    return true;
+}
+
 boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {
     const Extent2D tile_size = DefaultBlockSize(info.format);
     if (info.type == ImageType::Linear) {

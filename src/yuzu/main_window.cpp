@@ -46,6 +46,8 @@
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/nup_dialogs.h"
+#include "yuzu/shader_warm_dialog.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -1505,6 +1507,10 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
             &MainWindow::OnGameListConvertToNup);
+    connect(game_list, &GameList::PrepareShaderWarmRequested, this,
+            &MainWindow::OnGameListPrepareShaderWarm);
+    connect(game_list, &GameList::DeleteShaderWarmRequested, this,
+            &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
@@ -2011,6 +2017,14 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                     "converted."));
         return;
     }
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        QMessageBox::information(this, tr("Shader Precache in Progress"),
+                                 tr("Games cannot be started while the shader precache is being "
+                                    "built. Wait for it to finish or cancel it."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
     if (boot_in_progress || close_pending) {
         return;
     }
@@ -2092,6 +2106,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         Settings::UpdateGPUAccuracy();
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
+    PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -4404,6 +4419,132 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
             Qt::QueuedConnection);
         return result;
     }));
+}
+
+namespace {
+/// The game's title as its loader reports it, else the file name without extension.
+QString GameTitleName(const std::string& game_path) {
+    if (const auto loader = Loader::GetLoader(
+            *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read))) {
+        std::string title;
+        if (loader->ReadTitle(title) == Loader::ResultStatus::Success) {
+            return QString::fromStdString(title);
+        }
+    }
+    return QFileInfo(QString::fromStdString(game_path)).completeBaseName();
+}
+} // namespace
+
+/// Opens the shader precache dialog for the game and starts the build, or brings a running one to
+/// the front. Refused while a game runs or while this game is being converted.
+void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path) {
+    if (shader_warm_dialog) {
+        if (shader_warm_dialog->IsRunning()) {
+            shader_warm_dialog->raise();
+            shader_warm_dialog->activateWindow();
+            return;
+        }
+        shader_warm_dialog->close();
+    }
+    if (QtCommon::emu_thread != nullptr) {
+        QMessageBox::information(this, tr("Precache Shaders"),
+                                 tr("Close the running game first."));
+        return;
+    }
+    if (nup_running && game_path == nup_source_path) {
+        QMessageBox::information(this, tr("Precache Shaders"),
+                                 tr("This game is being converted. Try again when it is done."));
+        return;
+    }
+
+    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    shader_warm_dialog =
+        new ShaderWarmDialog(*QtCommon::system, path, program_id, GameTitleName(game_path), this);
+    connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
+    shader_warm_dialog->show();
+    shader_warm_dialog->Start();
+}
+
+/// With precache_shaders on: a title precached before is precached again only when the driver or
+/// its precache file changed (the renderer checks). For one never precached, Ask asks whether to
+/// precache before the game starts, and a title without a precache file gets one built from its
+/// game files first. A stopped or failed build starts the game without precaching.
+void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    ShaderWarm::RequestWarmBeforeStart(false);
+    const auto mode = Settings::values.precache_shaders.GetValue();
+    // The precache runs where the disk shader cache loads.
+    if (title_id == 0 || mode == Settings::PrecacheShaders::Off ||
+        !Settings::values.use_disk_shader_cache.GetValue()) {
+        return;
+    }
+    if (!ShaderWarm::WarmPending(title_id)) {
+        // Precached before: the renderer runs it again only when the driver or the file changed.
+        ShaderWarm::RequestWarmBeforeStart(true);
+        return;
+    }
+    if (mode == Settings::PrecacheShaders::Ask) {
+        QMessageBox box(QMessageBox::Question, tr("Precache Shaders"),
+                        tr("The shaders of this game are not precached yet. Precache them now?\n\n"
+                           "The game starts when they are done. The first time, the game files "
+                           "are read and their shaders are built on every CPU thread, with the "
+                           "shaders earlier play sessions saved, which takes a few minutes. Later "
+                           "launches only build what is new, until the GPU driver changes. The "
+                           "loading screen has a Skip button.\n\n"
+                           "You can change this in Configure, Graphics, Advanced."),
+                        QMessageBox::NoButton, this);
+        QPushButton* const precache = box.addButton(tr("Precache now"), QMessageBox::AcceptRole);
+        box.addButton(tr("Start without"), QMessageBox::RejectRole);
+        box.setDefaultButton(precache);
+        box.exec();
+        const bool now = box.clickedButton() == precache;
+        LOG_INFO(Frontend, "Shader precache before the game starts: {}", now ? "yes" : "no");
+        if (!now) {
+            return;
+        }
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+        ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
+                                GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
+        connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
+            if (ok) {
+                dialog.accept();
+            }
+        });
+        dialog.Start();
+        dialog.exec();
+        if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+            return;
+        }
+    }
+    ShaderWarm::RequestWarmBeforeStart(true);
+}
+
+/// Deletes the game's precache files after a confirmation, showing the error when it fails.
+void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning() &&
+        shader_warm_dialog->TitleId() == program_id) {
+        // The builder writes this title's files: deleting them under it would lose the result or
+        // fail it. Other titles' files are in their own folders.
+        QMessageBox::information(this, tr("Delete Shader Precache"),
+                                 tr("Shaders are being precached. Try again when it is done."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+    if (QMessageBox::question(this, tr("Delete Shader Precache"),
+                              tr("Delete the shader precache files of this game? They are built "
+                                 "again the next time the game is precached."),
+                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    std::string error;
+    if (!DeleteShaderWarmFiles(program_id, error)) {
+        QMessageBox::critical(this, tr("Delete Shader Precache"),
+                              tr("The files could not be deleted: %1")
+                                  .arg(QString::fromStdString(error)));
+    }
 }
 
 void MainWindow::OnGameListExtractNup(const std::string& game_path) {

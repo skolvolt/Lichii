@@ -98,13 +98,16 @@ public:
         return lowered_native;
     }
 
+    /// False for a program with instructions outside what is cached, or with more values of a
+    /// kind than a cache record holds
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
     [[nodiscard]] u64 CalculateHash() const;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
-    void Serialize(std::ofstream& file) const;
+    /// Writes the environment, with the host's Shader::HostTranslateInfo::EnvironmentReadProperties
+    void Serialize(std::ofstream& file, u32 read_properties) const;
 
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
@@ -215,9 +218,27 @@ private:
 std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
                                          Tegra::MemoryManager& memory, u32 bank, u32 offset);
 
+/// Answers for reads a FileEnvironment has no record of (shader precache: programs from the game
+/// files, never run, converted only to fill the driver's cache). Without it a missing read is an
+/// error.
+struct GuessMissing {
+    u32 cbuf_bank0{0x10000000};  ///< Constant buffer 0 (driver constants, descriptor handles)
+    u32 cbuf_other{0};           ///< Other constant buffers (game constants)
+    Shader::TextureType texture_type{Shader::TextureType::ColorArray2D};
+    Shader::TexturePixelFormat pixel_format{static_cast<Shader::TexturePixelFormat>(16)};
+    bool storage_pointer_bank0{true};  ///< Bank 0 always held storage pointers in the test title's records
+    bool storage_pointer_other{false}; ///< Banks 1-4 never did (95% identical SPIR-V offline)
+};
+
 class FileEnvironment final : public Shader::Environment {
 public:
     FileEnvironment() = default;
+
+    /// Missing reads get these answers instead of an error; the guess must outlive the
+    /// environment.
+    void SetGuessMissing(const GuessMissing* guess_) noexcept {
+        guess = guess_;
+    }
     ~FileEnvironment() override = default;
 
     FileEnvironment& operator=(FileEnvironment&&) noexcept = default;
@@ -226,7 +247,8 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file);
+    /// Reads an environment that must end before `end`, the end of the file
+    void Deserialize(std::ifstream& file, std::streampos end);
 
     [[nodiscard]] size_t MemorySize() const;
 
@@ -273,6 +295,16 @@ public:
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
+    /// Whether the translator asked for a constant buffer value, texture or pointer classification
+    /// the record lacks, while the record was made where translation reads the same values (with
+    /// these `read_properties`, see Shader::HostTranslateInfo::EnvironmentReadProperties) or by a
+    /// build that didn't record where: then it was made before the translator read the value. A
+    /// record made where they differ can lack it and hold all that translation reads there.
+    [[nodiscard]] bool LacksRecordedValue(u32 read_properties) const noexcept {
+        return lacks_recorded_value &&
+               (!recorded_read_properties || *recorded_read_properties == read_properties);
+    }
+
 private:
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
@@ -288,20 +320,70 @@ private:
     u32 read_highest{};
     u32 initial_offset{};
     u32 viewport_transform_state = 1;
+    const GuessMissing* guess{};
+    /// The EnvironmentReadProperties of the host that made the record, when its build wrote them
+    std::optional<u32> recorded_read_properties;
+    bool lacks_recorded_value{};
 };
 
+/// Where a pipeline is in a cache file, from its environment count to the end of its key, and a
+/// hash of those bytes: a rewrite removes it only while the file still holds them.
+struct PipelineRecord {
+    u64 begin;
+    u64 end;
+    u64 hash;
+    /// For a record removed as a copy, where the earlier record with the same bytes begins (else 0)
+    u64 copy_of{};
+
+    bool operator==(const PipelineRecord&) const = default;
+};
+
+/// Appends a record with the host's Shader::HostTranslateInfo::EnvironmentReadProperties, holding
+/// the cache's lock (see PipelineCacheLockPath).
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
-                       const std::filesystem::path& filename, u32 cache_version);
+                       const std::filesystem::path& filename, u32 cache_version,
+                       u32 read_properties);
 
 template <typename Key, typename Envs>
-    requires std::is_trivially_copyable_v<Key>
-        && std::has_unique_object_representations_v<Key>
-void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename, u32 cache_version) {
-    SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
+    requires std::is_trivially_copyable_v<Key> && std::has_unique_object_representations_v<Key>
+void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename,
+                       u32 cache_version, u32 read_properties) {
+    SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)),
+                      std::span(envs.data(), envs.size()), filename, cache_version,
+                      read_properties);
 }
 
+/// Reads the pipelines of a cache file. The callbacks read the key that ends each record first, so
+/// that a record cut short throws before it is built. A damaged record is dropped with the records
+/// after it, and the file is cut back to the complete records before it; running out of memory
+/// only stops the load. The load holds the cache's lock throughout (waiting for it as
+/// PipelineCacheLockWait says), so that a record another process is appending is not taken for a
+/// damaged one.
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
+
+/// The record a LoadPipelines callback has read: from `begin`, where its environment count is, to
+/// where `file` is now, after its key.
+[[nodiscard]] PipelineRecord ReadPipelineRecord(std::ifstream& file, u64 begin);
+
+/// Throws std::ios_base::failure, as for a damaged record, unless a graphics record's key has as
+/// many nonzero shader hashes as the record has environments: one is built from each.
+void CheckGraphicsRecord(std::span<const u64> unique_hashes, size_t num_envs);
+
+/// Throws std::ios_base::failure, as for a damaged record, unless a compute record's key has the
+/// shared memory and workgroup sizes of its environment: both are read from the same launch.
+void CheckComputeRecord(const FileEnvironment& env, u32 shared_memory_size,
+                        const std::array<u32, 3>& workgroup_size);
+
+/// Rewrites a cache file without these records (complete records LoadPipelines read from it when
+/// it was `loaded_size` bytes long), keeping every other byte, records appended since included. The
+/// new file is written beside the cache and renamed over it, so the cache is never left partly
+/// written. All of it happens under the cache's lock, and only while the file still holds every
+/// record as the load read it (and a copy's original); else, or when another process holds the
+/// lock, disk space is short, it is stopped, or the last rewrite of this file failed and it hasn't
+/// changed since, it returns false and leaves the file as it was.
+bool RemovePipelines(std::stop_token stop, const std::filesystem::path& filename, u32 cache_version,
+                     u64 loaded_size, std::vector<PipelineRecord> records);
 
 } // namespace VideoCommon

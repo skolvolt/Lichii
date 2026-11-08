@@ -63,6 +63,8 @@ add_library(
     free_region_manager.h
     fs/file.cpp
     fs/file.h
+    fs/file_lock.cpp
+    fs/file_lock.h
     fs/fs.cpp
     fs/fs.h
     fs/fs_paths.h

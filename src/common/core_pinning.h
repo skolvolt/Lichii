@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -37,5 +38,9 @@ struct GpuThreadPinning {
 /// sibling shares it, and the guest cores get the remaining performance cores. Core 0 takes most
 /// interrupts, so the GPU threads get the next two.
 [[nodiscard]] GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processors);
+
+/// The CPUs of a Linux sysfs CPU list such as "0-3,8,10-11", in order. Empty for an empty or
+/// malformed list.
+[[nodiscard]] std::vector<u32> ParseCpuList(std::string_view list);
 
 } // namespace Common

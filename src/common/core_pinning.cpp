@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <charconv>
 
 #include "common/core_pinning.h"
 
@@ -41,6 +42,36 @@ GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processo
         }
     }
     return plan;
+}
+
+std::vector<u32> ParseCpuList(std::string_view list) {
+    std::vector<u32> cpus;
+    while (!list.empty() && (list.back() == '\n' || list.back() == ' ')) {
+        list.remove_suffix(1);
+    }
+    const auto number = [](std::string_view text, u32& value) {
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        return error == std::errc{} && end == text.data() + text.size();
+    };
+    while (!list.empty()) {
+        const size_t comma = list.find(',');
+        const std::string_view range = list.substr(0, comma);
+        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        const size_t dash = range.find('-');
+        u32 first{};
+        u32 last{};
+        if (!number(range.substr(0, dash), first) ||
+            !number(dash == std::string_view::npos ? range.substr(0, dash) : range.substr(dash + 1),
+                    last) ||
+            last < first || last - first >= 4096) {
+            return {};
+        }
+        // 64-bit, so a range ending at the largest u32 doesn't wrap to 0 and loop forever.
+        for (u64 cpu = first; cpu <= last; ++cpu) {
+            cpus.push_back(static_cast<u32>(cpu));
+        }
+    }
+    return cpus;
 }
 
 } // namespace Common

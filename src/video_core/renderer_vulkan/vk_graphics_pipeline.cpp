@@ -591,7 +591,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{read_handle(desc, index)};
+                const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                      ? VideoCommon::NULL_TEXTURE_HANDLE
+                                      : read_handle(desc, index)};
                 views.push_back({handle.first});
 
                 if (use_bind_memo) {

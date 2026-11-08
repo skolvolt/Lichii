@@ -240,6 +240,10 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 return builder.BuildWidget(
                     setting, apply_funcs, ConfigurationShared::RequestType::ReverseSlider, true,
                     0.5f, nullptr, tr("%", "FSR/SGSR sharpening percentage (e.g. 50%)"));
+            } else if (setting->Id() == Settings::values.frame_rate_limit.Id()) {
+                return builder.BuildWidget(setting, apply_funcs,
+                                           ConfigurationShared::RequestType::Slider, true, 1.0f,
+                                           nullptr, tr(" Hz", "Frame rate limit (e.g. 120 Hz)"));
             } else {
                 return builder.BuildWidget(setting, apply_funcs);
             }

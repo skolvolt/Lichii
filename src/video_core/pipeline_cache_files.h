@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -13,6 +14,7 @@
 #include <fmt/format.h>
 
 #include "common/common_types.h"
+#include "common/fs/file_lock.h"
 
 namespace VideoCommon {
 
@@ -64,6 +66,22 @@ static_assert(VulkanPipelineCacheVersion == 54,
     const std::filesystem::path& directory, std::string_view stem, u32 version) {
     return directory / fmt::format("{}.fork-v{}.bin", stem, version);
 }
+
+/// The file whose lock (Common::FS::FileLock) is held by whatever writes a guest environment cache
+/// (PipelineCacheMagic), which is appended to in place, so that emulators running at once never
+/// write it together or read what another is writing. The driver pipeline cache is replaced whole
+/// by a rename and has no lock.
+[[nodiscard]] inline std::filesystem::path PipelineCacheLockPath(
+    const std::filesystem::path& file) {
+    auto lock = file;
+    lock += ".lock";
+    return lock;
+}
+
+/// How long one waits for that lock while another emulator holds it: longer than a load, append
+/// or rewrite takes, but a crashed emulator holds it while it writes a crash dump. Then a load goes
+/// on as where the file system has no locks, and an append is left out.
+inline constexpr std::chrono::seconds PipelineCacheLockWait{5};
 
 /// True when the file starts with this magic number followed by this cache version.
 [[nodiscard]] inline bool PipelineCacheHeaderMatches(const std::filesystem::path& file,
@@ -148,6 +166,12 @@ inline PipelineCacheCarryOver CarryOverPipelineCache(const std::filesystem::path
     if (std::filesystem::exists(destination, error) || error) {
         return {};
     }
+    // Another emulator starting the same cache, or appending to it once started, goes first: the
+    // copy is made only while there is no cache of this version (see CopyCompatiblePipelineCache).
+    std::optional<Common::FS::FileLock> lock;
+    if (magic == PipelineCacheMagic) {
+        lock.emplace(PipelineCacheLockPath(destination), PipelineCacheLockWait);
+    }
     for (const u32 source_version : versions) {
         const auto source = VersionedPipelineCachePath(directory, stem, source_version);
         if (!std::filesystem::is_regular_file(source, error)) {
@@ -192,6 +216,12 @@ inline PipelineCacheClear ClearPipelineCache(const std::filesystem::path& direct
     });
     if (!exists && !has_older) {
         return PipelineCacheClear::Missing;
+    }
+    // A running game appending to it or rewriting it finishes first, so it can't bring back what
+    // is removed here.
+    std::optional<Common::FS::FileLock> lock;
+    if (magic == PipelineCacheMagic) {
+        lock.emplace(PipelineCacheLockPath(file), PipelineCacheLockWait);
     }
     if (exists && !std::filesystem::remove(file, error)) {
         return PipelineCacheClear::Failed;

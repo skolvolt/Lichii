@@ -157,6 +157,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
               "of the session if its output fails Lichii's checks.\nTakes effect when a game "
               "starts."));
+    INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
+           tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
+              "\nAbove 60 Hz most games run too fast; use it with a game patch that follows real "
+              "time, such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect when a "
+              "game starts."));
     INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
@@ -294,7 +299,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Determines the number of depth slices processed in a single dispatch.\n"
               "Increasing this can improve throughput on high-end GPUs but may cause TDR or driver "
               "timeouts on weaker hardware."));
-    INSERT(Settings, pin_gpu_threads, tr("Pin GPU threads to their own cores (experimental)"),
+    INSERT(Settings, pin_gpu_threads, tr("Pin GPU threads to their own cores"),
            tr("Pins the emulator's GPU threads to dedicated physical CPU cores and keeps the "
               "emulated CPU cores off them.\n"
               "Can hurt performance on CPUs with few cores. Skipped on CPUs with fewer than 6 "
@@ -305,6 +310,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, precache_shaders, tr("Precache shaders before game start:"),
+           tr("Builds shaders on the loading screen, on every CPU thread, so they don't stutter "
+              "the first time the game uses them: the compute shaders found in the game files, "
+              "and the shaders saved by earlier play sessions that the normal shader loading "
+              "leaves for later. The first launch reads the game files and takes a few minutes; "
+              "later launches only build what is new, until the GPU driver changes. The loading "
+              "screen has a Skip button.\nAsk asks at launch while the game has never been "
+              "precached."));
     INSERT(Settings, native_async_draws, tr("Switch 2 draws with unbuilt pipelines:"),
            tr("Only applies when asynchronous shader building is on. Decides what a Switch 2 draw "
               "does when its graphics pipeline is still building.\n"
@@ -710,6 +723,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(ConsoleMode, Docked, tr("Docked")),
                               PAIR(ConsoleMode, Handheld, tr("Handheld")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::PrecacheShaders>::Index(),
+                          {
+                              PAIR(PrecacheShaders, Off, tr("Off")),
+                              PAIR(PrecacheShaders, Ask, tr("Ask")),
+                              PAIR(PrecacheShaders, Always, tr("Always")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::NativeAsyncDraws>::Index(),
                           {

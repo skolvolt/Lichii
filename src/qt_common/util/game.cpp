@@ -246,15 +246,10 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
     using VideoCommon::PipelineCacheClear;
     const auto result = [&] {
         switch (target) {
-        case GameListRemoveTarget::GlShaderCache: {
-            const auto file = VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "opengl", VideoCommon::OpenGLPipelineCacheVersion);
-            if (!Common::FS::Exists(file)) {
-                return PipelineCacheClear::Missing;
-            }
-            return Common::FS::RemoveFile(file) ? PipelineCacheClear::Cleared
-                                                : PipelineCacheClear::Failed;
-        }
+        case GameListRemoveTarget::GlShaderCache:
+            return VideoCommon::ClearPipelineCache(shader_cache_folder_path, "opengl",
+                                                   VideoCommon::PipelineCacheMagic, {},
+                                                   VideoCommon::OpenGLPipelineCacheVersion);
         case GameListRemoveTarget::VkShaderCache: {
             // An empty cache stays in its place when an older one is on disk, so the next boot
             // doesn't start from that one again.

@@ -1578,13 +1578,15 @@ private:
         if (!low || low->base != 1 || guard_failed) {
             return std::nullopt;
         }
-        const s64 end{low->c + addr->imm_offset + StoreSize(inst.GetOpcode())};
-        if (end > s64{0xffffffff}) {
+        // Below zero, invocation 0's offset wraps modulo 2^32 (see IdBound).
+        const s64 start{low->c + addr->imm_offset};
+        const s64 end{start + StoreSize(inst.GetOpcode())};
+        if (start < 0 || end > s64{0xffffffff}) {
             return std::nullopt;
         }
         StorageWriteExtent result{
             .bounded = true,
-            .const_end = static_cast<u32>((std::max)(end, s64{0})),
+            .const_end = static_cast<u32>(end),
         };
         for (size_t i = 0; i < 3; ++i) {
             if (low->coef[i] >= COEF_LIMIT || low->coef[i + 3] >= COEF_LIMIT) {
