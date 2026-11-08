@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -340,11 +344,15 @@ const char* Exception::what() const noexcept {
     return string_VkResult(result);
 }
 
+void FlushDeferredImageDestroys(VkDevice device); // nup: defined with Image::Release
+bool DeferImageViewDestroy(VkDevice device, VkImageView view, PFN_vkDestroyImageView destroy);
+
 void Destroy(VkInstance instance, const InstanceDispatch& dld) noexcept {
     dld.vkDestroyInstance(instance, nullptr);
 }
 
 void Destroy(VkDevice device, const InstanceDispatch& dld) noexcept {
+    FlushDeferredImageDestroys(device); // nup: pending deferred vkDestroyImage first
     dld.vkDestroyDevice(device, nullptr);
 }
 
@@ -394,6 +402,10 @@ void Destroy(VkDevice device, VkImage handle, const DeviceDispatch& dld) noexcep
 }
 
 void Destroy(VkDevice device, VkImageView handle, const DeviceDispatch& dld) noexcept {
+    // nup: deferred like images (EDEN_NX2_DEFER_IMAGE_DESTROY), on the same thread, in order.
+    if (DeferImageViewDestroy(device, handle, dld.vkDestroyImageView)) {
+        return;
+    }
     dld.vkDestroyImageView(device, handle, nullptr);
 }
 
@@ -523,8 +535,109 @@ void Image::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_IMAGE, name);
 }
 
+namespace {
+// nup EDEN_NX2_DEFER_IMAGE_DESTROY (=1 to enable): vkDestroyImage, a kernel call on NVIDIA,
+// on a thread of its own. Ocarina's texture cache destroys a few images every frame on the GPU
+// back thread (~4% of it). The memory goes back to VMA at once on the caller's thread (VMA is
+// externally synchronized there); the unused image is destroyed afterwards, which Vulkan allows.
+class ImageDestroyer {
+public:
+    static ImageDestroyer& Get() {
+        static ImageDestroyer instance;
+        return instance;
+    }
+    static bool Enabled() {
+        static const bool enabled = [] {
+            // Opt-in (=1): no measured frame-time gain in Ocarina (the back thread isn't the limit).
+            const char* v = std::getenv("EDEN_NX2_DEFER_IMAGE_DESTROY");
+            return v != nullptr && v[0] == '1';
+        }();
+        return enabled;
+    }
+    void Push(VkDevice device, VkImage image, PFN_vkDestroyImage destroy) {
+        PushEntry({device, image, destroy, VK_NULL_HANDLE, nullptr});
+    }
+    void Push(VkDevice device, VkImageView view, PFN_vkDestroyImageView destroy) {
+        PushEntry({device, VK_NULL_HANDLE, nullptr, view, destroy});
+    }
+    /// Destroys everything queued for `device` (before the device goes).
+    void Flush(VkDevice device) {
+        std::unique_lock lock{mutex};
+        idle_cv.wait(lock, [&] {
+            return busy == 0 && std::ranges::none_of(queue, [&](const Entry& e) {
+                return e.device == device;
+            });
+        });
+    }
+
+private:
+    struct Entry {
+        VkDevice device;
+        VkImage image;
+        PFN_vkDestroyImage destroy;
+        VkImageView view;
+        PFN_vkDestroyImageView destroy_view;
+    };
+    void PushEntry(const Entry& entry) {
+        {
+            std::scoped_lock lock{mutex};
+            if (!thread.joinable()) {
+                thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+            }
+            queue.push_back(entry);
+        }
+        cv.notify_one();
+    }
+    void Run(std::stop_token stop) {
+        std::unique_lock lock{mutex};
+        while (!stop.stop_requested()) {
+            cv.wait(lock, stop, [&] { return !queue.empty(); });
+            std::vector<Entry> batch;
+            batch.swap(queue);
+            ++busy;
+            lock.unlock();
+            for (const Entry& e : batch) {
+                if (e.view != VK_NULL_HANDLE) {
+                    e.destroy_view(e.device, e.view, nullptr);
+                } else {
+                    e.destroy(e.device, e.image, nullptr);
+                }
+            }
+            lock.lock();
+            --busy;
+            idle_cv.notify_all();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::condition_variable_any idle_cv;
+    std::vector<Entry> queue;
+    int busy{};
+    std::jthread thread;
+};
+} // Anonymous namespace
+
+bool DeferImageViewDestroy(VkDevice device, VkImageView view, PFN_vkDestroyImageView destroy) {
+    if (!ImageDestroyer::Enabled()) {
+        return false;
+    }
+    ImageDestroyer::Get().Push(device, view, destroy);
+    return true;
+}
+
+void FlushDeferredImageDestroys(VkDevice device) {
+    if (ImageDestroyer::Enabled()) {
+        ImageDestroyer::Get().Flush(device);
+    }
+}
+
 void Image::Release() const noexcept {
     if (handle) {
+        if (allocation != nullptr && ImageDestroyer::Enabled()) {
+            vmaFreeMemory(allocator, allocation);
+            ImageDestroyer::Get().Push(owner, handle, dld->vkDestroyImage);
+            return;
+        }
         vmaDestroyImage(allocator, handle, allocation);
     }
 }
