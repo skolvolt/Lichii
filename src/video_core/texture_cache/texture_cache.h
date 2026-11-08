@@ -3383,10 +3383,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 auto& view = slot_image_views[view_id];
                 view.gpu_addr = view.gpu_addr - old_gpu_addr + gpu_addr;
             }
-            // As a deletion does: no memo (#717 binding and render target memos) keeps its views.
+            // As JoinImages does for a new image: the moved image's memos and those of the images
+            // already at its new place (lookups there may now resolve to it) go stale. Not the
+            // global memo epoch: ~650 moves a second made 40,000 of 46,000 memo misses.
             ++bindings_epoch;
             BumpBindingSerial(reuse_id);
-            BumpBindingEpoch();
+            ForEachImageInRegion(cpu_addr, image.guest_size_bytes,
+                                 [this](ImageId id, ImageBase&) { BumpBindingSerial(id); });
+            static const bool global_epoch = std::getenv("EDEN_NX2_RELOC_GLOBAL_EPOCH") != nullptr;
+            if (global_epoch) { // A/B: the old way, every memo stale
+                BumpBindingEpoch();
+            }
             std::ranges::replace(rt_image_id, reuse_id, ImageId{});
             if (rt_depth_image_id == reuse_id) {
                 rt_depth_image_id = ImageId{};
