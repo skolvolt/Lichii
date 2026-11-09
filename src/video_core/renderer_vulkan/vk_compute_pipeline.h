@@ -114,6 +114,10 @@ public:
         return is_built.load(std::memory_order::acquire) &&
                build_failed.load(std::memory_order::acquire);
     }
+    /// Whether the build ended, with a pipeline or not.
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order::acquire);
+    }
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.

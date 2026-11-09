@@ -122,6 +122,9 @@ struct ComputePipelineCacheEntry {
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
+    /// A rebuild still compiling: dispatches keep this entry's pipeline until it is ready
+    /// (zortos293/Lichii#969).
+    std::unique_ptr<ComputePipelineCacheEntry> pending;
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
