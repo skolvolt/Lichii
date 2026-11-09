@@ -3386,21 +3386,103 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return false;
         }
     };
-    if (nup_relocate > 0 && clearing_render_targets_lookup &&
+    const auto same_shape = [&](const ImageInfo& a) {
+        return a.format == new_info.format && a.type == new_info.type &&
+               a.size.width == new_info.size.width && a.size.height == new_info.size.height &&
+               a.size.depth == new_info.size.depth &&
+               a.resources.levels == new_info.resources.levels &&
+               a.resources.layers == new_info.resources.layers &&
+               a.block.width == new_info.block.width && a.block.height == new_info.block.height &&
+               a.block.depth == new_info.block.depth && a.num_samples == new_info.num_samples &&
+               a.tile_width_spacing == new_info.tile_width_spacing &&
+               a.layer_stride == new_info.layer_stride && a.pitch == new_info.pitch &&
+               a.native_tiling == new_info.native_tiling;
+    };
+    // Moves image reuse_id to this address in place of a new image (views, framebuffers and memory
+    // stay; old-address lookups go).
+    const auto relocate_image = [&](ImageId reuse_id) -> ImageId {
+        Image& image = slot_images[reuse_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, reuse_id);
+        }
+        UnregisterImage(reuse_id);
+        total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
+        // Out of its old allocation group (InsertImage adds it to the new address's).
+        const auto alloc_it = image_allocs_table.find(image.gpu_addr);
+        if (alloc_it != image_allocs_table.end()) {
+            const ImageAllocId alloc_id = alloc_it->second;
+            auto& alloc_images = slot_image_allocs[alloc_id].images;
+            std::erase(alloc_images, reuse_id);
+            if (alloc_images.empty()) {
+                image_allocs_table.erase(alloc_it);
+                slot_image_allocs.erase(alloc_id);
+            }
+        }
+        for (const AliasedImage& alias : image.aliased_images) {
+            ImageBase& other = slot_images[alias.id];
+            std::erase_if(other.aliased_images,
+                          [reuse_id](const AliasedImage& a) { return a.id == reuse_id; });
+            other.CheckAliasState();
+        }
+        for (const ImageId overlap_id : image.overlapping_images) {
+            ImageBase& other = slot_images[overlap_id];
+            std::erase(other.overlapping_images, reuse_id);
+            other.CheckBadOverlapState();
+        }
+        image.aliased_images.clear();
+        image.overlapping_images.clear();
+        image.CheckAliasState();
+        image.CheckBadOverlapState();
+        // Views and framebuffers carry the old address in their lookups: drop them, as a
+        // deletion does; the image itself (and its memory) stays.
+        auto& dirty = maxwell3d->dirty.flags;
+        dirty[Dirty::RenderTargets] = true;
+        dirty[Dirty::ZetaBuffer] = true;
+        for (size_t rt = 0; rt < NUM_RT; ++rt) {
+            dirty[Dirty::ColorBuffer0 + rt] = true;
+        }
+        const std::vector<ImageViewId> view_ids = image.image_view_ids;
+        for (const ImageViewId view_id : view_ids) {
+            std::ranges::replace(render_targets.color_buffer_ids, view_id, ImageViewId{});
+            if (render_targets.depth_buffer_id == view_id) {
+                render_targets.depth_buffer_id = ImageViewId{};
+            }
+        }
+        // Address-keyed lookups (TIC views) go; the views themselves and their framebuffers
+        // depend only on the VkImage: they move with it.
+        RemoveImageViewReferences(view_ids);
+        const GPUVAddr old_gpu_addr = image.gpu_addr;
+        for (const ImageViewId view_id : view_ids) {
+            auto& view = slot_image_views[view_id];
+            view.gpu_addr = view.gpu_addr - old_gpu_addr + gpu_addr;
+        }
+        // As JoinImages does for a new image: the moved image's memos and those of the images
+        // already at its new place (lookups there may now resolve to it) go stale. Not the
+        // global memo epoch: ~650 moves a second made 40,000 of 46,000 memo misses.
+        ++bindings_epoch;
+        BumpBindingSerial(reuse_id);
+        ForEachImageInRegion(cpu_addr, image.guest_size_bytes,
+                             [this](ImageId id, ImageBase&) { BumpBindingSerial(id); });
+        static const bool global_epoch = std::getenv("EDEN_NX2_RELOC_GLOBAL_EPOCH") != nullptr;
+        if (global_epoch) { // A/B: the old way, every memo stale
+            BumpBindingEpoch();
+        }
+        std::ranges::replace(rt_image_id, reuse_id, ImageId{});
+        if (rt_depth_image_id == reuse_id) {
+            rt_depth_image_id = ImageId{};
+        }
+        image.gpu_addr = gpu_addr;
+        image.cpu_addr = cpu_addr;
+        image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
+        image.flags &= ~ImageFlagBits::CpuModified;
+        RegisterImage(reuse_id);
+        TrackImage(image, reuse_id);
+        ++nup_relocated;
+        return reuse_id;
+    };
+    if (nup_relocate > 0 && nup_relocate < 4 && clearing_render_targets_lookup &&
         !nup_guarded_shapes.contains(NupShapeKey(new_info)) &&
         (nup_relocate >= 2 || nup_cleared_whole())) { // nup: only targets this clear overwrites whole
-        const auto same_shape = [&](const ImageInfo& a) {
-            return a.format == new_info.format && a.type == new_info.type &&
-                   a.size.width == new_info.size.width && a.size.height == new_info.size.height &&
-                   a.size.depth == new_info.size.depth &&
-                   a.resources.levels == new_info.resources.levels &&
-                   a.resources.layers == new_info.resources.layers &&
-                   a.block.width == new_info.block.width && a.block.height == new_info.block.height &&
-                   a.block.depth == new_info.block.depth && a.num_samples == new_info.num_samples &&
-                   a.tile_width_spacing == new_info.tile_width_spacing &&
-                   a.layer_stride == new_info.layer_stride && a.pitch == new_info.pitch &&
-                   a.native_tiling == new_info.native_tiling;
-        };
         ImageId reuse_id{};
         ForEachImageInRegion(cpu_addr, size_bytes, [&](ImageId id, ImageBase& image) {
             if (reuse_id || !same_shape(image.info) || image.gpu_addr == gpu_addr ||
@@ -3430,84 +3512,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             });
         }
         if (reuse_id) {
-            Image& image = slot_images[reuse_id];
-            if (True(image.flags & ImageFlagBits::Tracked)) {
-                UntrackImage(image, reuse_id);
-            }
-            UnregisterImage(reuse_id);
-            total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
-            // Out of its old allocation group (InsertImage adds it to the new address's).
-            const auto alloc_it = image_allocs_table.find(image.gpu_addr);
-            if (alloc_it != image_allocs_table.end()) {
-                const ImageAllocId alloc_id = alloc_it->second;
-                auto& alloc_images = slot_image_allocs[alloc_id].images;
-                std::erase(alloc_images, reuse_id);
-                if (alloc_images.empty()) {
-                    image_allocs_table.erase(alloc_it);
-                    slot_image_allocs.erase(alloc_id);
-                }
-            }
-            for (const AliasedImage& alias : image.aliased_images) {
-                ImageBase& other = slot_images[alias.id];
-                std::erase_if(other.aliased_images,
-                              [reuse_id](const AliasedImage& a) { return a.id == reuse_id; });
-                other.CheckAliasState();
-            }
-            for (const ImageId overlap_id : image.overlapping_images) {
-                ImageBase& other = slot_images[overlap_id];
-                std::erase(other.overlapping_images, reuse_id);
-                other.CheckBadOverlapState();
-            }
-            image.aliased_images.clear();
-            image.overlapping_images.clear();
-            image.CheckAliasState();
-            image.CheckBadOverlapState();
-            // Views and framebuffers carry the old address in their lookups: drop them, as a
-            // deletion does; the image itself (and its memory) stays.
-            auto& dirty = maxwell3d->dirty.flags;
-            dirty[Dirty::RenderTargets] = true;
-            dirty[Dirty::ZetaBuffer] = true;
-            for (size_t rt = 0; rt < NUM_RT; ++rt) {
-                dirty[Dirty::ColorBuffer0 + rt] = true;
-            }
-            const std::vector<ImageViewId> view_ids = image.image_view_ids;
-            for (const ImageViewId view_id : view_ids) {
-                std::ranges::replace(render_targets.color_buffer_ids, view_id, ImageViewId{});
-                if (render_targets.depth_buffer_id == view_id) {
-                    render_targets.depth_buffer_id = ImageViewId{};
-                }
-            }
-            // Address-keyed lookups (TIC views) go; the views themselves and their framebuffers
-            // depend only on the VkImage: they move with it.
-            RemoveImageViewReferences(view_ids);
-            const GPUVAddr old_gpu_addr = image.gpu_addr;
-            for (const ImageViewId view_id : view_ids) {
-                auto& view = slot_image_views[view_id];
-                view.gpu_addr = view.gpu_addr - old_gpu_addr + gpu_addr;
-            }
-            // As JoinImages does for a new image: the moved image's memos and those of the images
-            // already at its new place (lookups there may now resolve to it) go stale. Not the
-            // global memo epoch: ~650 moves a second made 40,000 of 46,000 memo misses.
-            ++bindings_epoch;
-            BumpBindingSerial(reuse_id);
-            ForEachImageInRegion(cpu_addr, image.guest_size_bytes,
-                                 [this](ImageId id, ImageBase&) { BumpBindingSerial(id); });
-            static const bool global_epoch = std::getenv("EDEN_NX2_RELOC_GLOBAL_EPOCH") != nullptr;
-            if (global_epoch) { // A/B: the old way, every memo stale
-                BumpBindingEpoch();
-            }
-            std::ranges::replace(rt_image_id, reuse_id, ImageId{});
-            if (rt_depth_image_id == reuse_id) {
-                rt_depth_image_id = ImageId{};
-            }
-            image.gpu_addr = gpu_addr;
-            image.cpu_addr = cpu_addr;
-            image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
-            image.flags &= ~ImageFlagBits::CpuModified;
-            RegisterImage(reuse_id);
-            TrackImage(image, reuse_id);
-            ++nup_relocated;
-            return reuse_id;
+            return relocate_image(reuse_id);
         }
     }
     const bool broken_views = runtime.HasBrokenTextureViewFormats();
@@ -3577,6 +3582,50 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     };
     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
                                region_check_gpu);
+
+    // nup EDEN_NX2_RT_RELOCATE=4 (after Fritchii's EXP43=3, fable_answer_12 2A): decided after the
+    // overlap scan, unlike modes 1-3 (which ran before it, so their "no copies" check read the
+    // previous lookup's list). A render target the current clear overwrites whole, whose overlaps
+    // are only "bad" ones (no copies, aliases or remapped images), takes the place of the newest
+    // same-shape image it drifted off: one the GPU wrote, not used yet this frame, not bound as
+    // another current target, and of a shape never read or drawn into without a clear in a later
+    // frame (nup_guarded_shapes). Old contents can't show: the clear overwrites the whole target.
+    if (nup_relocate == 4 && clearing_render_targets_lookup && !join_bad_overlap_ids.empty() &&
+        join_copies_to_do.empty() && join_left_aliased_ids.empty() &&
+        join_right_aliased_ids.empty() && join_ignore_textures.empty() &&
+        !nup_guarded_shapes.contains(NupShapeKey(new_info)) && nup_cleared_whole()) {
+        const auto& regs = maxwell3d->regs;
+        const auto bound_elsewhere = [&](const ImageBase& old) {
+            for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+                const GPUVAddr address = regs.rt[index].Address();
+                if (address != 0 && address != gpu_addr &&
+                    regs.rt[index].format != Tegra::RenderTargetFormat::NONE &&
+                    old.OverlapsGPU(address, 1)) {
+                    return true;
+                }
+            }
+            return regs.zeta_enable && regs.zeta.Address() != 0 &&
+                   regs.zeta.Address() != gpu_addr && old.OverlapsGPU(regs.zeta.Address(), 1);
+        };
+        ImageId reuse_id{};
+        for (const ImageId id : join_bad_overlap_ids) {
+            ImageBase& old = slot_images[id];
+            if (!same_shape(old.info) || old.gpu_addr == gpu_addr ||
+                False(old.flags & ImageFlagBits::GpuModified) ||
+                True(old.flags & (ImageFlagBits::Remapped | ImageFlagBits::Sparse |
+                                  ImageFlagBits::IsDecoding | ImageFlagBits::Rescaled |
+                                  ImageFlagBits::Alias)) ||
+                lru_cache.Tick(old.lru_index) >= frame_tick || bound_elsewhere(old)) {
+                continue;
+            }
+            if (!reuse_id || old.modification_tick > slot_images[reuse_id].modification_tick) {
+                reuse_id = id;
+            }
+        }
+        if (reuse_id) {
+            return relocate_image(reuse_id);
+        }
+    }
 
     bool can_rescale = info.rescaleable;
     bool any_rescaled = false;
