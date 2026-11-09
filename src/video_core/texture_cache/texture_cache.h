@@ -471,6 +471,10 @@ void TextureCache<P>::TickFrame() {
         while (!gpu_sentenced_images.empty() &&
                runtime.IsFree(gpu_sentenced_images.front().tick)) {
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
+            if constexpr (requires(Image& image) { image.ReleaseToPool(u64{}); }) {
+                gpu_sentenced_images.front().image.ReleaseToPool(
+                    gpu_sentenced_images.front().bytes);
+            }
             gpu_sentenced_images.pop_front();
         }
     }
@@ -484,6 +488,9 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        if constexpr (requires { runtime.PooledImageBytes(); }) {
+            total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
+        }
     }
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.

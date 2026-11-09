@@ -75,6 +75,22 @@ struct ByteAddressedRange {
     return VkExtent2D{width / 2, height};
 }
 
+/// nup image pool (after Fritchii's EXP42): what a pooled VkImage was created with. Only images
+/// made with equal create info and the same view format list are interchangeable.
+struct ImagePoolKey {
+    bool valid{};
+    VkImageCreateFlags flags{};
+    VkFormat format{};
+    u32 width{};
+    u32 height{};
+    VkImageTiling tiling{};
+    VkImageUsageFlags usage{};
+    const VkFormat* view_formats{};
+    size_t view_format_count{};
+
+    bool operator==(const ImagePoolKey&) const noexcept = default;
+};
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -94,6 +110,16 @@ public:
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void TickFrame();
+
+    /// nup image pool (EDEN_NX2_IMAGE_POOL=1): a deleted render target's VkImage and memory, once
+    /// the GPU is done with it, for the next image made with the same key. A taken image is
+    /// UNDEFINED-layout with discarded contents, as a new one is. 512 MiB, 180 frames at most.
+    [[nodiscard]] vk::Image TakePooledImage(const ImagePoolKey& key);
+    void PoolImage(const ImagePoolKey& key, vk::Image image, u64 bytes);
+    [[nodiscard]] u64 PooledImageBytes() const noexcept {
+        return image_pool_bytes;
+    }
+    [[nodiscard]] static bool ImagePoolEnabled();
 
     void FlushDeferredClear();
 
@@ -344,6 +370,19 @@ public:
         vk::Buffer bridge;
     };
     std::deque<PendingByteAddressedShadow> pending_byte_addressed_shadows;
+
+    struct PooledImage {
+        ImagePoolKey key;
+        vk::Image image;
+        u64 bytes;
+        u64 frame;
+    };
+    std::deque<PooledImage> image_pool;
+    u64 image_pool_bytes{};
+    u64 image_pool_frame{};
+    u64 image_pool_taken{};
+    u64 image_pool_missed{};
+    u64 image_pool_given{};
 };
 
 class Framebuffer {
@@ -492,6 +531,10 @@ public:
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
+
+    /// nup image pool: hands the VkImage (and its memory) to the runtime's pool when it can be
+    /// reused; called once the GPU is done with a deleted image. bytes: its device memory.
+    void ReleaseToPool(u64 bytes);
 
     void DownloadMemory(VkBuffer buffer, size_t offset,
                         std::span<const VideoCommon::BufferImageCopy> copies);
@@ -670,6 +713,7 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
+    ImagePoolKey pool_key{}; ///< Before original_image: MakeImage fills it while that is made
     vk::Image original_image;
     vk::Image scaled_image;
 
