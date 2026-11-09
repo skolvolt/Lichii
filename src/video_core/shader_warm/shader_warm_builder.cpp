@@ -307,6 +307,38 @@ fs::path NativePreparationPath(u64 title_id) {
     return TitleDir(title_id) / "native-preparation.bin";
 }
 
+fs::path FindNativeRecipe(u64 title_id) {
+    std::error_code ec;
+    if (fs::exists(NativeRecipePath(title_id), ec)) {
+        return NativeRecipePath(title_id);
+    }
+    std::vector<fs::path> candidates;
+    for (const auto& entry :
+         fs::directory_iterator(Common::FS::GetExeDirectory() / "recipes", ec)) {
+        if (entry.path().extension() == ".nx2recipe" && entry.is_regular_file(ec)) {
+            candidates.push_back(entry.path());
+        }
+    }
+    std::ranges::sort(candidates);
+    for (const auto& path : candidates) {
+        const auto size = fs::file_size(path, ec);
+        if (ec || size > 64 * 1024 * 1024) {
+            continue;
+        }
+        std::vector<u8> bytes(size);
+        std::ifstream file(path, std::ios::binary);
+        if (!file.read(reinterpret_cast<char*>(bytes.data()),
+                       static_cast<std::streamsize>(bytes.size()))) {
+            continue;
+        }
+        const auto header = Nx2Recipe::ReadHeader(bytes);
+        if (header && header->title_id == title_id && header->cache_version == WarmCacheVersion) {
+            return path;
+        }
+    }
+    return {};
+}
+
 fs::path ComputeWarmPath(u64 title_id) {
     return TitleDir(title_id) / "warm-compute.bin";
 }
@@ -372,7 +404,10 @@ bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
 bool WarmPending(u64 title_id) {
     const auto file = ComputeWarmPath(title_id);
     std::error_code ec;
-    return !fs::exists(file, ec) || !fs::exists(WarmMarkerPath(file), ec);
+    if (!fs::exists(file, ec) || !fs::exists(WarmMarkerPath(file), ec)) {
+        return true;
+    }
+    return !fs::exists(NativePreparationPath(title_id), ec) && !FindNativeRecipe(title_id).empty();
 }
 
 void RequestWarmBeforeStart(bool before_start) {
@@ -908,11 +943,17 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     auto result = BuildComputeWarmFiles(system, game_path, title_id, options, progress, stop);
     const auto dir = options.output_dir.empty() ? TitleDir(title_id) : options.output_dir;
     std::error_code ec;
-    if ((options.recipe_path.empty() && !fs::exists(dir / "native.nx2recipe", ec)) ||
+    auto native_options = options;
+    if (native_options.recipe_path.empty() && !fs::exists(dir / "native.nx2recipe", ec) &&
+        options.output_dir.empty()) {
+        native_options.recipe_path = FindNativeRecipe(title_id);
+    }
+    if ((native_options.recipe_path.empty() && !fs::exists(dir / "native.nx2recipe", ec)) ||
         stop.stop_requested()) {
         return result;
     }
-    const auto native = BuildNativeFiles(system, game_path, title_id, options, progress, stop);
+    const auto native =
+        BuildNativeFiles(system, game_path, title_id, native_options, progress, stop);
     result.native_pipelines = native.native_pipelines;
     result.native_programs = native.native_programs;
     result.native_combinations = native.native_combinations;

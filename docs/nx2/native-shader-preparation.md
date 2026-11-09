@@ -35,8 +35,10 @@ are still precached from the game files alone, as before.
 
 ## Flow
 
-1. **Extract and assemble** (game list → *Build Shader Precache from Recipe...*, or *Rebuild
-   Shader Precache* once a recipe is kept). The existing compute precache is built first. Then:
+1. **Extract and assemble** (game list → *Build Shader Precache from Recipe...*; or *Build/Rebuild
+   Shader Precache*, and the launch-time precache, with a kept recipe or one in
+   `<exe dir>/recipes/*.nx2recipe` whose header names the title and this cache version, as
+   Fritchii ships them). The existing compute precache is built first. Then:
    - The recipe is checked: magic, title id, cache version and bounded sizes. Other emulators'
      caches are refused.
    - The game's effective RomFS is opened (base, update and LayeredFS mods, as the game sees it).
@@ -146,10 +148,23 @@ next to an empty `user` directory (portable mode), add keys and firmware, then:
    `Prepared native shaders: ... ignored`. During play, the 10 s report shows precompiled pipelines
    created, drawn and failed, and the reasons the precompiled path was refused.
 
+## Measured (Ocarina of Time v131072, RTX 4090, Ryzen 9 5900X)
+
+Fritchii v5.3's shipped recipe (`OoT v131072 (cache v54).nx2recipe`) with the player's `.nup`:
+
+- `nx2-precompile assemble`: 41,216 of 41,216 programs found, 0 not lowered, 120,461 pipelines,
+  0 dropped, 22 s; `check` replayed 62,740 environments through Lichii's translator with 22
+  failures (uncached storage pointers) and 0 mismatched keys.
+- In Lichii: the builder found 56,382 programs and 110,779 combinations; the loading screen built
+  120,436 records (25 failed) in 855.6 s, and 75,161 graphics and 4,085 compute pipelines were
+  loaded for draws (records sharing a key after the driver fields are rewritten are one).
+- During play, every 10 s report showed prepared pipelines created from kept infos and built
+  from kept SPIR-V with 0 failed and replaced (for example 683 in one report, 114 ms of GPU
+  thread time), and the player reported no shader stutter.
+
 ## Verification status
 
-Measured here: the unit tests (`tests.exe "[preparation]"`) and the build of the changed targets
-(see the commit message). Not run: the game, the preparation on a GPU, driver-cache retention,
-runtime hit rate, timing and memory on the RTX 4090 / Ryzen 9 5900X. The figures quoted above
-(1.17 GB, 133,016 pipelines, the cache-size behaviour) come from the #895 README (RTX 3080), not
-from this branch.
+Measured: the unit tests (`tests.exe "[preparation]"` and the whole suite) and the run above.
+Not measured: peak RAM during *Build*, boot time with a complete journal, driver-cache retention
+across reboots, AMD and Intel drivers. The 1.17 GB / 133,016 pipeline figures and the cache-size
+behaviour come from the #895 README (RTX 3080).

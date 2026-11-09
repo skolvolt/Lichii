@@ -30,6 +30,10 @@ std::filesystem::path ComputeWarmPath(u64 title_id);
 std::filesystem::path NativeRecipePath(u64 title_id);
 std::filesystem::path NativePreparationPath(u64 title_id);
 
+/// The recipe for this title: the kept one, else the first <exe dir>/recipes/*.nx2recipe whose
+/// header names this title and this build's cache version (as Fritchii ships them). Empty: none.
+std::filesystem::path FindNativeRecipe(u64 title_id);
+
 /// "Already precached" marker of a precache file (same folder, extension .done), written by the
 /// emulator after the precache ran to the end. A matching marker skips the precache at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
@@ -72,8 +76,8 @@ std::optional<WarmStamp> ReadWarmMarker(const std::filesystem::path& warm_file);
 bool WriteWarmMarker(const std::filesystem::path& warm_file, const WarmStamp& stamp);
 
 /// True when the title's precache has never finished: no precache file yet, or no marker next
-/// to it. A marker that no longer matches (new driver) is not seen here: the emulator checks that
-/// at boot.
+/// to it, or a recipe (FindNativeRecipe) not assembled yet. A marker that no longer matches (new
+/// driver) is not seen here: the emulator checks that at boot.
 bool WarmPending(u64 title_id);
 
 /// Whether this boot precaches before the game starts: Always, or Ask when the frontend asked and

@@ -4524,10 +4524,10 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         }
     }
     std::error_code ec;
-    // A kept recipe whose pipeline file was deleted is assembled again too.
+    // A recipe (kept, or shipped in recipes\) not assembled yet is assembled too.
     if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec) ||
-        (std::filesystem::exists(ShaderWarm::NativeRecipePath(title_id), ec) &&
-         !std::filesystem::exists(ShaderWarm::NativePreparationPath(title_id), ec))) {
+        (!std::filesystem::exists(ShaderWarm::NativePreparationPath(title_id), ec) &&
+         !ShaderWarm::FindNativeRecipe(title_id).empty())) {
         ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
                                 GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
         connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
