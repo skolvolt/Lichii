@@ -2102,7 +2102,6 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
         if (!slot_buffers.contains(buffer_id)) {
             return;
         }
-        Buffer& buffer = slot_buffers[buffer_id];
         const u64 span = (std::min<u64>)(room, 2_MiB);
         ExtentProbe probe{
             .shader_hash = compute_shader_hash,
@@ -2111,14 +2110,21 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
             .binding_size = binding.size,
             .request = request,
             .span = span,
-            .before = runtime.DownloadStagingBuffer(span, true),
         };
-        const BufferCopy copy{
-            .src_offset = buffer.Offset(tail),
-            .dst_offset = probe.before.offset,
-            .size = span,
+        // What the CPU would read there without the mark, taken before the dispatch. Bytes the
+        // cache already knows the GPU wrote, and CPU writes not in the buffer yet, may differ for
+        // other reasons: they are left out.
+        probe.guest.resize(span);
+        device_memory.ReadBlockUnsafe(tail, probe.guest.data(), span);
+        const auto skip = [&](DAddr begin, DAddr end) {
+            begin = (std::max)(begin, tail);
+            end = (std::min)(end, tail + span);
+            if (begin < end) {
+                probe.skip.emplace_back(begin - tail, end - tail);
+            }
         };
-        runtime.CopyBuffer(probe.before.buffer, buffer, std::span{&copy, 1}, true);
+        gpu_modified_ranges.ForEachInRange(tail, span, skip);
+        PendingCpuWriteRanges().ForEachInRange(tail, span, skip);
         extent_probes.push_back(std::move(probe));
         extent_trust[compute_shader_hash].probe_pending = true;
     }
@@ -2160,14 +2166,21 @@ void BufferCache<P>::CheckExtentProbes() {
         if (!runtime.IsFree(probe.tick)) {
             return false;
         }
-        const u8* const before = probe.before.mapped_span.data();
+        // The GPU's tail after the dispatch against guest memory before it: a difference is GPU
+        // data the cache would not have known about without the full mark.
+        const u8* const guest = probe.guest.data();
         const u8* const after = probe.after->mapped_span.data();
         u64 differing = 0;
         u64 first = ~u64{0};
         u64 last = 0;
-        if (std::memcmp(before, after, probe.span) != 0) {
+        if (std::memcmp(guest, after, probe.span) != 0) {
+            std::vector<bool> skipped(probe.span);
+            for (const auto& [begin, end] : probe.skip) {
+                std::fill(skipped.begin() + static_cast<std::ptrdiff_t>(begin),
+                          skipped.begin() + static_cast<std::ptrdiff_t>(end), true);
+            }
             for (u64 i = 0; i < probe.span; ++i) {
-                if (before[i] != after[i]) {
+                if (guest[i] != after[i] && !skipped[i]) {
                     ++differing;
                     first = (std::min)(first, i);
                     last = i;
@@ -2199,7 +2212,6 @@ void BufferCache<P>::CheckExtentProbes() {
             }
             ++extent_probes_trusted;
         }
-        runtime.FreeDeferredStagingBuffer(probe.before);
         runtime.FreeDeferredStagingBuffer(*probe.after);
         return true;
     });

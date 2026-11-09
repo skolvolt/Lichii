@@ -919,10 +919,11 @@ private:
     /// 2026-11-09). The store analysis bounds how far a native compute program writes, and only
     /// that much is marked GPU-written; one program writes past it, and the CPU then read stale
     /// guest bytes back (particle positions turned into one right vertex and garbage). Each program
-    /// is marked in full until a dispatch at its dims was checked: its tail past the proof is
-    /// copied right before and right after that one dispatch and compared. No change: the proof
-    /// holds at these dims (and at smaller ones). A change: the program is marked in full for the
-    /// session and logged. EDEN_NX2_EXTENT_CHECK=0 skips the check (the proof is trusted as before).
+    /// is marked in full until a dispatch at its dims was checked: its tail past the proof, as
+    /// the GPU left it after that one dispatch, is compared with guest memory from right before
+    /// it (known GPU writes and unapplied CPU writes left out). The same: the proof holds at these
+    /// dims (and at smaller ones). Different: the program is marked in full for the session and
+    /// logged, naming it. EDEN_NX2_EXTENT_CHECK=0 skips the check (the proof is trusted as before).
     struct ExtentTrust {
         std::array<u32, 3> block{};
         std::array<u32, 3> grid{};
@@ -944,7 +945,13 @@ private:
         u64 binding_size{};
         ExtentProbeRequest request{};
         u64 span{};
-        Async_Buffer before{};
+        /// Guest memory of the tail at bind (fable_answer_26). Under the full mark the CPU's reads
+        /// bring the GPU's bytes into guest memory, so only a copy made before the dispatch shows
+        /// what the CPU would have read without the mark.
+        std::vector<u8> guest;
+        /// Tail offsets [begin, end) left out of the compare: known GPU writes and CPU writes not
+        /// applied to the buffer yet.
+        std::vector<std::pair<u64, u64>> skip;
         std::optional<Async_Buffer> after;
         u64 tick{};
     };
