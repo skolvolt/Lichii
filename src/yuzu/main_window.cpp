@@ -4957,9 +4957,9 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
-    // nup: this build is shared as "Skitchii v1" (based on Lichii).
+    // nup: this build is shared as "Skitchii v1.1" (based on Lichii).
     const std::string window_title =
-        fmt::format("Skitchii v1 (Lichii {}) | {}", std::string{Common::g_build_version},
+        fmt::format("Skitchii v1.1 (Lichii {}) | {}", std::string{Common::g_build_version},
                     std::string{Common::g_compiler_id});
 
     if (title_name.empty()) {
