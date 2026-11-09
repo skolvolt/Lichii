@@ -442,6 +442,46 @@ vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::pat
 }
 constexpr u32 NoInfo = ~0U;
 
+/// nup: reads `files` (directories: every file in them) start to end at low priority. A prepared
+/// pipeline reads a few small pieces of the ~2.5 GB of prepared files (and the driver reads its
+/// own cache entry); on a hard disk each such read cost ~10-20 ms (first visits: 24 ms a pipeline,
+/// 3 s for one area's 122) unless the file is already in the OS file cache. One sequential pass
+/// puts it there. ponytail: relies on the OS keeping it cached; a RAM copy if that proves too weak.
+void PrereadFiles(std::stop_token stop, std::vector<std::filesystem::path> paths) {
+    Common::SetCurrentThreadName("ShaderPreread");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    std::vector<std::filesystem::path> files;
+    for (const auto& path : paths) {
+        std::error_code error;
+        if (std::filesystem::is_directory(path, error)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                     path, std::filesystem::directory_options::skip_permission_denied, error)) {
+                if (entry.is_regular_file(error)) {
+                    files.push_back(entry.path());
+                }
+            }
+        } else if (std::filesystem::is_regular_file(path, error)) {
+            files.push_back(path);
+        }
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    std::vector<char> buffer(size_t{4} << 20);
+    u64 total = 0;
+    for (const auto& file_path : files) {
+        std::ifstream file(file_path, std::ios::binary);
+        while (file && !stop.stop_requested()) {
+            file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            total += static_cast<u64>(file.gcount());
+        }
+        if (stop.stop_requested()) {
+            return;
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Read ahead {} MiB of prepared shader files ({} files) in {:.1f} s",
+             total >> 20, files.size(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+}
+
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     runtime_spirv_ns[thread].fetch_add(
@@ -2208,6 +2248,18 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
              "Prepared native shaders: {} graphics and {} compute pipelines, {} damaged records "
              "ignored",
              precompiled_records.size(), precompiled_compute_records.size(), rejected);
+    // nup EDEN_NX2_PRECOMPILED_PREREAD (default on, 0 = off): see PrereadFiles.
+    static const bool preread = [] {
+        const char* const value = std::getenv("EDEN_NX2_PRECOMPILED_PREREAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (preread && !precompiled_records.empty() && !prepared_preread.joinable()) {
+        std::vector<std::filesystem::path> paths{precompiled, infos};
+        if (const char* const driver_cache = std::getenv("__GL_SHADER_DISK_CACHE_PATH")) {
+            paths.emplace_back(driver_cache);
+        }
+        prepared_preread = std::jthread(PrereadFiles, std::move(paths));
+    }
     return true;
 }
 

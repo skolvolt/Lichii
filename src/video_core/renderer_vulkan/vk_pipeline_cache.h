@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -392,6 +393,10 @@ private:
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
     PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
+    /// nup: reads the prepared shader files (and a custom NVIDIA cache folder) once, start to end,
+    /// after they load, so the per-pipeline reads come from the OS file cache. Last member: stopped
+    /// and joined first when the cache is destroyed.
+    std::jthread prepared_preread;
 };
 
 } // namespace Vulkan
