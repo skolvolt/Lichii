@@ -270,7 +270,11 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
-    std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
+    /// Starts past every earlier manager's: one built where a destroyed one was must not match
+    /// the translations a thread kept for that one (Translations compares owner and generation).
+    static inline std::atomic<u64> next_generation_base{1};
+    /// Bumped by Map and Unmap
+    std::atomic<u64> translation_generation{next_generation_base.fetch_add(1ULL << 32)};
     static constexpr u64 armed_page_count = device_as_size >> page_bits;
     /// Pages ArmReadTraps ever covered, one bit each (MayHaveArmedReadTraps).
     std::unique_ptr<std::atomic<u64>[]> armed_pages{
