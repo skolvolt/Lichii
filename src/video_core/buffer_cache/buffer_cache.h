@@ -154,10 +154,11 @@ void BufferCache<P>::TickFrame() {
                           largest.end(), std::greater<>{});
         LOG_INFO(HW_GPU,
                  "Buffer cache: {} buffers {} MiB; largest {}; compute write extents: {} checks "
-                 "held, {} programs marked in full",
+                 "held, {} programs marked in full, {} full marks for checks",
                  count, total >> 20,
                  fmt::join(largest.begin(), largest.begin() + std::min<size_t>(6, largest.size()), ", "),
-                 extent_probes_trusted, extent_probes_distrusted);
+                 extent_probes_trusted, extent_probes_distrusted, extent_full_marks);
+        extent_full_marks = 0;
     }
 
     // Calculate hits and shots and move hit bits to the right
@@ -992,6 +993,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                     }
                     if (trust.distrusted || bigger) {
                         mark = binding.size;
+                        ++extent_full_marks;
                         if (!trust.distrusted && !trust.probe_pending) {
                             extent_probe_requests[ssbo_index] = ExtentProbeRequest{
                                 .active = true,
@@ -2030,6 +2032,9 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u64 write_mark_limit =
             native ? u64{channel_state->compute_storage_write_marks[index]} : ~u64{0};
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
+            if (native && is_written) {
+                ProbeExtentTail(index, binding);
+            }
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
@@ -2040,30 +2045,8 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
-        // Write extent check (ExtentTrust): the tail past the proof, as it is right before this
-        // dispatch. RecordComputeExtentProbes copies it again right after.
-        if constexpr (!IS_OPENGL) {
-        if (const ExtentProbeRequest& request = extent_probe_requests[index];
-            request.active && native && is_written && request.proven < size) {
-            const u64 span = (std::min<u64>)(size - request.proven, 2_MiB);
-            ExtentProbe probe{
-                .shader_hash = compute_shader_hash,
-                .buffer_id = binding.buffer_id,
-                .device_addr = binding.device_addr,
-                .binding_size = size,
-                .request = request,
-                .span = span,
-                .before = runtime.DownloadStagingBuffer(span, true),
-            };
-            const BufferCopy copy{
-                .src_offset = offset + request.proven,
-                .dst_offset = probe.before.offset,
-                .size = span,
-            };
-            runtime.CopyBuffer(probe.before.buffer, buffer, std::span{&copy, 1}, true);
-            extent_probes.push_back(std::move(probe));
-            extent_trust[compute_shader_hash].probe_pending = true;
-        }
+        if (native && is_written) {
+            ProbeExtentTail(index, binding);
         }
 
         const u32 mark =
@@ -2082,6 +2065,66 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
 }
 
 template <class P>
+void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
+    // Write extent check (ExtentTrust): the tail past the proof, as it is right before this
+    // dispatch (after the bind's uploads). RecordComputeExtentProbes copies it again right after.
+    if constexpr (!IS_OPENGL) {
+        const ExtentProbeRequest& request = extent_probe_requests[index];
+        if (!request.active || request.proven >= binding.size) {
+            return;
+        }
+        BufferId buffer_id = binding.buffer_id;
+        DAddr tail = binding.device_addr + request.proven;
+        u64 room = binding.size - request.proven;
+        if (binding.segment_count >= 2) {
+            // A binding over several buffers: its segments cover it in order.
+            if (binding.segment_first > compute_segments.size() ||
+                binding.segment_count > compute_segments.size() - binding.segment_first) {
+                return;
+            }
+            u64 skip = request.proven;
+            bool found = false;
+            for (u32 i = 0; i < binding.segment_count; ++i) {
+                const MultiRangeSegment& segment = compute_segments[binding.segment_first + i];
+                if (skip < segment.size) {
+                    buffer_id = segment.buffer_id;
+                    tail = segment.device_addr + skip;
+                    room = segment.size - skip;
+                    found = true;
+                    break;
+                }
+                skip -= segment.size;
+            }
+            if (!found) {
+                return;
+            }
+        }
+        if (!slot_buffers.contains(buffer_id)) {
+            return;
+        }
+        Buffer& buffer = slot_buffers[buffer_id];
+        const u64 span = (std::min<u64>)(room, 2_MiB);
+        ExtentProbe probe{
+            .shader_hash = compute_shader_hash,
+            .buffer_id = buffer_id,
+            .device_addr = tail,
+            .binding_size = binding.size,
+            .request = request,
+            .span = span,
+            .before = runtime.DownloadStagingBuffer(span, true),
+        };
+        const BufferCopy copy{
+            .src_offset = buffer.Offset(tail),
+            .dst_offset = probe.before.offset,
+            .size = span,
+        };
+        runtime.CopyBuffer(probe.before.buffer, buffer, std::span{&copy, 1}, true);
+        extent_probes.push_back(std::move(probe));
+        extent_trust[compute_shader_hash].probe_pending = true;
+    }
+}
+
+template <class P>
 void BufferCache<P>::RecordComputeExtentProbes() {
     if constexpr (IS_OPENGL) {
         return;
@@ -2093,7 +2136,7 @@ void BufferCache<P>::RecordComputeExtentProbes() {
         Buffer& buffer = slot_buffers[probe.buffer_id];
         probe.after = runtime.DownloadStagingBuffer(probe.span, true);
         const BufferCopy copy{
-            .src_offset = buffer.Offset(probe.device_addr) + probe.request.proven,
+            .src_offset = buffer.Offset(probe.device_addr),
             .dst_offset = probe.after->offset,
             .size = probe.span,
         };

@@ -940,7 +940,7 @@ private:
     struct ExtentProbe {
         u64 shader_hash{};
         BufferId buffer_id{};
-        DAddr device_addr{}; ///< The binding's start
+        DAddr device_addr{}; ///< The tail's start (in buffer_id)
         u64 binding_size{};
         ExtentProbeRequest request{};
         u64 span{};
@@ -954,8 +954,10 @@ private:
     std::vector<ExtentProbe> extent_probes;
     u64 extent_probes_trusted{};
     u64 extent_probes_distrusted{};
+    u64 extent_full_marks{};
 
     void CheckExtentProbes();
+    void ProbeExtentTail(u32 index, const Binding& binding);
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
