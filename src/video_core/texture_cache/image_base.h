@@ -130,6 +130,8 @@ struct ImageBase {
 
     u64 modification_tick = 0;
     size_t lru_index = SIZE_MAX;
+    bool nup_guard_noted = false; ///< nup: its shape is in nup_guarded_shapes
+    u64 nup_write_frame = ~0ULL; ///< nup: frame_tick of the last GPU write (relocation guard)
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

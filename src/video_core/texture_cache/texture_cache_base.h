@@ -195,6 +195,15 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 nup_relocated{}, nup_pooled{}; ///< nup: TC_LOG counters
+    /// nup relocation guard (after Fritchii's EXP43 guard): shapes of render targets the game reads
+    /// or draws into without a clear in a frame after the one that wrote them. Those hold contents
+    /// across frames (cached sky, shadow tiles), so moving or pooling them shows old pictures.
+    /// ponytail: per shape, not per address; per-address guards if a guarded shape costs speed.
+    ::Common::unordered_set<u64> nup_guarded_shapes;
+    static u64 NupShapeKey(const ImageInfo& info) noexcept {
+        return (u64(info.format) << 40) | (u64(info.size.width) << 20) | u64(info.size.height);
+    }
+    void NupCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate);
     bool clearing_render_targets_lookup{}; ///< nup: JoinImages runs for a render target lookup
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read

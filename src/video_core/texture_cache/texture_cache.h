@@ -1044,6 +1044,7 @@ typename TextureCache<P>::BindingMemo* TextureCache<P>::FindBinding(const Bindin
         }
         if (memo.touch_tick != frame_tick) {
             if (has_image) {
+                NupCrossFrameUse(slot_images[image_id], false, false);
                 lru_cache.Touch(slot_images[image_id].lru_index, frame_tick);
             }
             memo.touch_tick = frame_tick;
@@ -3386,6 +3387,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     };
     if (nup_relocate > 0 && clearing_render_targets_lookup &&
+        !nup_guarded_shapes.contains(NupShapeKey(new_info)) &&
         (nup_relocate >= 2 || nup_cleared_whole())) { // nup: only targets this clear overwrites whole
         const auto same_shape = [&](const ImageInfo& a) {
             return a.format == new_info.format && a.type == new_info.type &&
@@ -4789,6 +4791,21 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     NoteGpuModified(image);
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    image.nup_write_frame = frame_tick;
+}
+
+template <class P>
+void TextureCache<P>::NupCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate) {
+    if (invalidate || image.nup_guard_noted || image.nup_write_frame == ~0ULL ||
+        image.nup_write_frame == frame_tick || image.info.type != ImageType::e2D) {
+        return;
+    }
+    image.nup_guard_noted = true;
+    if (nup_guarded_shapes.insert(NupShapeKey(image.info)).second) {
+        LOG_INFO(HW_GPU, "nup: render target shape {} {}x{} never relocates now: {} in a later frame",
+                 static_cast<u32>(image.info.format), image.info.size.width,
+                 image.info.size.height, is_modification ? "drawn into without a clear" : "read");
+    }
 }
 
 template <class P>
@@ -4860,6 +4877,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
+    NupCrossFrameUse(image, is_modification, invalidate);
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
