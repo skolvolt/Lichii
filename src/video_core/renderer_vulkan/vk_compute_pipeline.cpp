@@ -404,6 +404,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
     buffer_cache.UnbindComputeStorageBuffers();
+    buffer_cache.SetComputeShaderHash(shader_hash);
     size_t ssbo_index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);

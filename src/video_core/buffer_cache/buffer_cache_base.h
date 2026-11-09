@@ -329,6 +329,15 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// The compute program whose storage buffers are bound next (its write extents are checked
+    /// per program, see ExtentTrust).
+    void SetComputeShaderHash(u64 hash) noexcept {
+        compute_shader_hash = hash;
+    }
+
+    /// Records the "after" copies of the write extent checks of the dispatch just recorded.
+    void RecordComputeExtentProbes();
+
     /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U,
@@ -905,6 +914,48 @@ private:
         }
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
     }
+
+    /// Write extent self-check (fable_answer_25; Ocarina of Time's glowing triangles,
+    /// 2026-11-09). The store analysis bounds how far a native compute program writes, and only
+    /// that much is marked GPU-written; one program writes past it, and the CPU then read stale
+    /// guest bytes back (particle positions turned into one right vertex and garbage). Each program
+    /// is marked in full until a dispatch at its dims was checked: its tail past the proof is
+    /// copied right before and right after that one dispatch and compared. No change: the proof
+    /// holds at these dims (and at smaller ones). A change: the program is marked in full for the
+    /// session and logged. EDEN_NX2_EXTENT_CHECK=0 skips the check (the proof is trusted as before).
+    struct ExtentTrust {
+        std::array<u32, 3> block{};
+        std::array<u32, 3> grid{};
+        bool distrusted{};
+        bool probe_pending{};
+    };
+    struct ExtentProbeRequest {
+        bool active{};
+        u64 proven{};
+        u64 pointer{};
+        u64 pad{};
+        std::array<u32, 3> block{};
+        std::array<u32, 3> grid{};
+    };
+    struct ExtentProbe {
+        u64 shader_hash{};
+        BufferId buffer_id{};
+        DAddr device_addr{}; ///< The binding's start
+        u64 binding_size{};
+        ExtentProbeRequest request{};
+        u64 span{};
+        Async_Buffer before{};
+        std::optional<Async_Buffer> after;
+        u64 tick{};
+    };
+    u64 compute_shader_hash{};
+    std::unordered_map<u64, ExtentTrust> extent_trust;
+    std::array<ExtentProbeRequest, NUM_STORAGE_BUFFERS> extent_probe_requests{};
+    std::vector<ExtentProbe> extent_probes;
+    u64 extent_probes_trusted{};
+    u64 extent_probes_distrusted{};
+
+    void CheckExtentProbes();
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
