@@ -1509,6 +1509,8 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListConvertToNup);
     connect(game_list, &GameList::PrepareShaderWarmRequested, this,
             &MainWindow::OnGameListPrepareShaderWarm);
+    connect(game_list, &GameList::PrepareShaderWarmFromRecipeRequested, this,
+            &MainWindow::OnGameListPrepareShaderWarmFromRecipe);
     connect(game_list, &GameList::DeleteShaderWarmRequested, this,
             &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
@@ -4438,6 +4440,24 @@ QString GameTitleName(const std::string& game_path) {
 /// Opens the shader precache dialog for the game and starts the build, or brings a running one to
 /// the front. Refused while a game runs or while this game is being converted.
 void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path) {
+    StartShaderWarm(program_id, game_path, {});
+}
+
+/// As OnGameListPrepareShaderWarm, with a precompile recipe the player picks: its pipelines are
+/// assembled from the game files and prepared on the loading screen with the precache.
+void MainWindow::OnGameListPrepareShaderWarmFromRecipe(u64 program_id,
+                                                       const std::string& game_path) {
+    const QString file =
+        QFileDialog::getOpenFileName(this, tr("Select Precompile Recipe"), {},
+                                     tr("Lichii precompile recipes (*.nx2recipe);;All files (*)"));
+    if (file.isEmpty()) {
+        return;
+    }
+    StartShaderWarm(program_id, game_path, std::filesystem::path{file.toStdU16String()});
+}
+
+void MainWindow::StartShaderWarm(u64 program_id, const std::string& game_path,
+                                 const std::filesystem::path& recipe) {
     if (shader_warm_dialog) {
         if (shader_warm_dialog->IsRunning()) {
             shader_warm_dialog->raise();
@@ -4458,8 +4478,8 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
     }
 
     const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
-    shader_warm_dialog =
-        new ShaderWarmDialog(*QtCommon::system, path, program_id, GameTitleName(game_path), this);
+    shader_warm_dialog = new ShaderWarmDialog(*QtCommon::system, path, program_id,
+                                              GameTitleName(game_path), this, recipe);
     connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
     shader_warm_dialog->show();
     shader_warm_dialog->Start();
@@ -4504,7 +4524,10 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         }
     }
     std::error_code ec;
-    if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+    // A kept recipe whose pipeline file was deleted is assembled again too.
+    if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec) ||
+        (std::filesystem::exists(ShaderWarm::NativeRecipePath(title_id), ec) &&
+         !std::filesystem::exists(ShaderWarm::NativePreparationPath(title_id), ec))) {
         ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
                                 GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
         connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {

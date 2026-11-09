@@ -487,6 +487,16 @@ ShaderCache::Entry* ShaderCache::NewEntry(VAddr addr, VAddr addr_end, ShaderInfo
     return entry_pointer;
 }
 
+u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept {
+    u32 mask = 0;
+    for (size_t index = 0; index < 32; ++index) {
+        if ((sph.vtg.imap_generic_vector[index >> 1] >> ((index % 2) * 4)) & 0xF) {
+            mask |= 1U << index;
+        }
+    }
+    return mask;
+}
+
 const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
     auto info = std::make_unique<ShaderInfo>();
     if (const std::optional<u64> cached_hash{env.Analyze()}) {
@@ -501,6 +511,9 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->size_bytes = env.ReadSizeBytes();
     }
     info->lowered_native = env.LoweredNative();
+    if (env.IsNativeProgram() && env.ShaderStage() == Shader::Stage::VertexB) {
+        info->generic_read_mask = GenericReadMask(env.SPH());
+    }
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);

@@ -25,7 +25,7 @@ class QLabel;
 class QProgressBar;
 class QPushButton;
 
-/// True when the title has a shader precache file.
+/// True when the title has a shader precache file or a precompile recipe.
 bool ShaderWarmFilesExist(u64 title_id);
 
 /// Removes the title's precache files. Returns false and fills `error` on failure.
@@ -37,8 +37,10 @@ class ShaderWarmDialog : public QDialog {
     Q_OBJECT
 
 public:
+    /// With `recipe`, its pipelines are assembled too; without, the title's kept recipe is.
     explicit ShaderWarmDialog(Core::System& system, std::filesystem::path game_path, u64 title_id,
-                              const QString& game_name, QWidget* parent = nullptr);
+                              const QString& game_name, QWidget* parent = nullptr,
+                              std::filesystem::path recipe = {});
     ~ShaderWarmDialog() override;
 
     void Start();
@@ -64,6 +66,7 @@ private:
 
     Core::System& system;
     std::filesystem::path game_path;
+    std::filesystem::path recipe;
     u64 title_id;
 
     QLabel* stage_label{};

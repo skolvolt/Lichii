@@ -103,6 +103,8 @@ add_executable(tests
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
+    video_core/canonical_native_key.cpp
+    video_core/native_preparation.cpp
     video_core/shader_precache.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp

@@ -329,6 +329,21 @@ public:
         return build->Failed();
     }
 
+    /// The shader info of a pipeline stage (vertex B to fragment), null for a stage it lacks.
+    [[nodiscard]] const Shader::Info* StageInfo(size_t stage) const noexcept {
+        return stage_present[stage] ? &stage_infos[stage] : nullptr;
+    }
+
+    /// Built from a precompiled pipeline's recorded environments and shader infos (see
+    /// PipelineCache::CreatePrecompiledGraphicsPipeline): a failed build is replaced by a
+    /// pipeline translated from the game's state.
+    void MarkPrecompiled() noexcept {
+        precompiled = true;
+    }
+    [[nodiscard]] bool IsPrecompiled() const noexcept {
+        return precompiled;
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -372,6 +387,8 @@ private:
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    std::array<bool, NUM_STAGES> stage_present{};
+    bool precompiled{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};

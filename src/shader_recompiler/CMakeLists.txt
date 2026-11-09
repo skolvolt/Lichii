@@ -198,6 +198,8 @@ add_library(shader_recompiler STATIC
     profile.h
     program_header.h
     runtime_info.h
+    info_serialize.cpp
+    info_serialize.h
     shader_info.h
     storage_write_extent.h
     varying_state.h)

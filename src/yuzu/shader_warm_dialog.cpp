@@ -27,7 +27,8 @@ bool ShaderWarmFilesExist(u64 title_id) {
         return false;
     }
     std::error_code ec;
-    return std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec);
+    return std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec) ||
+           std::filesystem::exists(ShaderWarm::NativeRecipePath(title_id), ec);
 }
 
 bool DeleteShaderWarmFiles(u64 title_id, std::string& error) {
@@ -50,6 +51,18 @@ QString StageText(const std::string& stage) {
     if (stage == "Writing") {
         return ShaderWarmDialog::tr("Writing the precache file");
     }
+    if (stage == "Checking game contents") {
+        return ShaderWarmDialog::tr("Checking game contents and updates");
+    }
+    if (stage == "Extracting native shaders") {
+        return ShaderWarmDialog::tr("Extracting native shaders");
+    }
+    if (stage == "Assembling pipelines from recipe") {
+        return ShaderWarmDialog::tr("Assembling pipelines from the recipe");
+    }
+    if (stage == "Writing native preparation") {
+        return ShaderWarmDialog::tr("Writing the native pipeline file");
+    }
     return QString::fromStdString(stage);
 }
 
@@ -57,8 +70,10 @@ QString StageText(const std::string& stage) {
 
 /// Builds the stage label, progress bar, result text and the Cancel/Close button.
 ShaderWarmDialog::ShaderWarmDialog(Core::System& system_, std::filesystem::path game_path_,
-                                   u64 title_id_, const QString& game_name, QWidget* parent)
-    : QDialog(parent), system{system_}, game_path{std::move(game_path_)}, title_id{title_id_} {
+                                   u64 title_id_, const QString& game_name, QWidget* parent,
+                                   std::filesystem::path recipe_)
+    : QDialog(parent), system{system_}, game_path{std::move(game_path_)},
+      recipe{std::move(recipe_)}, title_id{title_id_} {
     setWindowTitle(tr("Precache shaders: %1").arg(game_name));
     setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     setModal(false);
@@ -130,7 +145,10 @@ void ShaderWarmDialog::Start() {
         // report it as a failed build instead.
         auto result = std::make_shared<ShaderWarm::Result>();
         try {
-            *result = ShaderWarm::BuildWarmFiles(system, game_path, title_id, on_progress, stop);
+            ShaderWarm::BuildOptions options;
+            options.recipe_path = recipe;
+            *result = ShaderWarm::BuildWarmFilesWith(system, game_path, title_id, options,
+                                                     on_progress, stop);
         } catch (const std::exception& e) {
             result->ok = false;
             result->error = e.what();
@@ -194,6 +212,19 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
             text = tr("Compute programs: %L1")
                        .arg(static_cast<qulonglong>(result.compute_programs));
         }
+        if (result.native_pipelines > 0) {
+            text += QLatin1Char('\n') +
+                    tr("Native pipelines from the recipe: %L1 (%L2 programs and %L3 combinations "
+                       "found in the game files)")
+                        .arg(static_cast<qulonglong>(result.native_pipelines))
+                        .arg(static_cast<qulonglong>(result.native_programs))
+                        .arg(static_cast<qulonglong>(result.native_combinations));
+            if (result.native_dropped > 0) {
+                text +=
+                    QLatin1Char('\n') + tr("Recipe pipelines this copy of the game lacks: %L1")
+                                            .arg(static_cast<qulonglong>(result.native_dropped));
+            }
+        }
         if (result.skipped > 0) {
             text += QLatin1Char('\n') +
                     tr("Skipped (could not be read or converted): %L1")
@@ -201,7 +232,7 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
         }
         text += QStringLiteral("\n\n") +
                 tr("It is built on the loading screen when Precache shaders before game start is "
-                   "on.");
+                   "on. An interrupted build continues where it stopped.");
     } else if (stopped) {
         stage_label->setText(tr("Shader precache stopped."));
     } else {

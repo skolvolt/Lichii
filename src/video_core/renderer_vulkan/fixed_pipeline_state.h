@@ -268,6 +268,12 @@ struct FixedPipelineState {
     /// attachments, from the blend and color mask registers. Clears the flag.
     void RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d);
 
+    /// Native (Switch 2) pipelines: clears state that cannot change the pipeline, so draws that
+    /// differ only there share one and precompiled keys match them: attribute types of inputs the
+    /// vertex program does not read (vertex input is dynamic), blend equations and factors of
+    /// attachments without blending, and attachments past the last colour target.
+    void CanonicalizeNative(u32 generic_read_mask) noexcept;
+
     size_t Hash() const noexcept;
 
     bool operator==(const FixedPipelineState& rhs) const noexcept;

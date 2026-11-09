@@ -41,7 +41,12 @@ struct ShaderInfo {
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+    /// Native vertex programs: the generic attributes their header says they read.
+    u32 generic_read_mask{~0U};
 };
+
+/// Generic attributes a vertex program's header says it reads (any component of each).
+u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept;
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
     static constexpr u64 YUZU_PAGEBITS = 14;

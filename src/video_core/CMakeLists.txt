@@ -218,6 +218,10 @@ add_library(video_core STATIC
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
     renderer_vulkan/vk_master_semaphore.h
+    nx2_recipe.cpp
+    nx2_recipe.h
+    shader_warm/prepared_store.cpp
+    shader_warm/prepared_store.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_cache_records.cpp
@@ -583,3 +587,14 @@ if (ENABLE_NVIDIA_DLSS)
 endif()
 
 create_target_directory_groups(video_core)
+
+set(preparation_revision "${CMAKE_CURRENT_BINARY_DIR}/native_preparation_revision.h")
+add_custom_target(native_preparation_revision
+    COMMAND ${CMAKE_COMMAND} -DSOURCE=${PROJECT_SOURCE_DIR}
+        -DOUTPUT=${preparation_revision}
+        "-DTOOLCHAIN=${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_CXX_FLAGS};${CMAKE_CXX_FLAGS_RELEASE}"
+        -P ${PROJECT_SOURCE_DIR}/CMakeModules/NativePreparationRevision.cmake
+    BYPRODUCTS ${preparation_revision}
+    VERBATIM)
+add_dependencies(video_core native_preparation_revision)
+target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})

@@ -126,6 +126,8 @@ add_library(core STATIC
     file_sys/ips_layer.h
     file_sys/kernel_executable.cpp
     file_sys/kernel_executable.h
+    file_sys/nx2_shader_extract.cpp
+    file_sys/nx2_shader_extract.h
     file_sys/nca_metadata.cpp
     file_sys/nca_metadata.h
     file_sys/partition_filesystem.cpp

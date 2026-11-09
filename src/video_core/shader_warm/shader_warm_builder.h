@@ -25,6 +25,11 @@ namespace VideoCommon::ShaderWarm {
 /// files, in pipeline cache format with no recorded reads.
 std::filesystem::path ComputeWarmPath(u64 title_id);
 
+/// The title's precompile recipe (tools/nx2-precompile), kept once a build used it, and the
+/// pipeline file assembled from it with the player's game files, which the loading screen prepares.
+std::filesystem::path NativeRecipePath(u64 title_id);
+std::filesystem::path NativePreparationPath(u64 title_id);
+
 /// "Already precached" marker of a precache file (same folder, extension .done), written by the
 /// emulator after the precache ran to the end. A matching marker skips the precache at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
@@ -88,6 +93,9 @@ bool TakeWarmBeforeStart();
 /// game starts. Taken (and cleared) by the renderer.
 void RequestSkipWarm();
 bool TakeSkipWarm();
+/// Whether Skip was pressed, without clearing it (the native preparation runs before the
+/// precache, and one Skip stops both).
+bool SkipWarmRequested();
 
 /// The GPU driver, device and pipeline cache version pipelines were precached for.
 struct DriverStamp {
@@ -126,6 +134,10 @@ struct Result {
     bool ok{};
     std::string error;           ///< Empty when ok
     size_t archives{};           ///< Shader archives found in the game files
+    size_t native_pipelines{};   ///< Pipelines assembled from the recipe
+    size_t native_dropped{};     ///< Recipe pipelines whose programs this copy lacks
+    size_t native_programs{};    ///< Native programs found in the game files
+    size_t native_combinations{}; ///< Program combinations (variations) found
     size_t compute_programs{};   ///< Entries written to the precache file
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
@@ -141,6 +153,8 @@ Result BuildWarmFiles(Core::System& system, const std::filesystem::path& game_pa
 struct BuildOptions {
     /// Folder for warm-compute.bin; empty: <shader dir>/<title id>.
     std::filesystem::path output_dir;
+    /// Recipe to assemble; empty: the one kept from an earlier build, if any.
+    std::filesystem::path recipe_path;
     /// Conversion threads, 0: a quarter of the CPU threads, 2 to 6.
     size_t threads{};
 };

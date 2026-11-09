@@ -17,6 +17,9 @@
 #include <unordered_set>
 
 #include <fmt/format.h>
+#include <openssl/evp.h>
+
+#include "native_preparation_revision.h"
 
 #include "common/cityhash.h"
 #include "common/fs/fs_util.h"
@@ -25,10 +28,14 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/file_sys/nup_container.h"
+#include "core/file_sys/nx2_shader_extract.h"
 #include "core/file_sys/romfs.h"
+#include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
+#include "video_core/nx2_recipe.h"
+#include "video_core/shader_warm/prepared_store.h"
 #include "video_core/shader_warm/shader_archives.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -292,6 +299,14 @@ void WriteWarmCount(const fs::path& warm_file, u64 entries) {
 
 } // Anonymous namespace
 
+fs::path NativeRecipePath(u64 title_id) {
+    return TitleDir(title_id) / "native.nx2recipe";
+}
+
+fs::path NativePreparationPath(u64 title_id) {
+    return TitleDir(title_id) / "native-preparation.bin";
+}
+
 fs::path ComputeWarmPath(u64 title_id) {
     return TitleDir(title_id) / "warm-compute.bin";
 }
@@ -373,6 +388,10 @@ void RequestSkipWarm() {
     skip_warm.store(true, std::memory_order_relaxed);
 }
 
+bool SkipWarmRequested() {
+    return skip_warm.load(std::memory_order_relaxed);
+}
+
 bool TakeSkipWarm() {
     return skip_warm.exchange(false, std::memory_order_relaxed);
 }
@@ -426,7 +445,10 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
     tmp += ".tmp";
     bool ok = true;
     for (const auto& path :
-         {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, PrecachedPipelinesPath(title_id)}) {
+         {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, PrecachedPipelinesPath(title_id),
+          NativeRecipePath(title_id), NativePreparationPath(title_id),
+          TitleDir(title_id) / "native-prepared.journal",
+          TitleDir(title_id) / "native-source.txt"}) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -439,6 +461,230 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
     return ok;
 }
 
+namespace {
+
+constexpr std::string_view StageNativeChecking = "Checking game contents";
+constexpr std::string_view StageNativeExtracting = "Extracting native shaders";
+constexpr std::string_view StageNativeAssembling = "Assembling pipelines from recipe";
+constexpr std::string_view StageNativeWriting = "Writing native preparation";
+
+/// The RomFS the game sees: base, update and LayeredFS mods applied.
+FileSys::VirtualDir OpenEffectiveRomFS(Core::System& system, const fs::path& game_path,
+                                       u64 title_id, std::string& error) {
+    FileSys::VirtualFilesystem filesystem = system.GetFilesystem();
+    if (filesystem == nullptr) {
+        filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
+    }
+    const auto file =
+        filesystem->OpenFile(Common::FS::PathToUTF8String(game_path), FileSys::OpenMode::Read);
+    auto loader = file ? Loader::GetLoader(system, file) : nullptr;
+    u64 program_id{};
+    if (!loader || loader->ReadProgramId(program_id) != Loader::ResultStatus::Success ||
+        program_id != title_id) {
+        error = "The selected game file does not match this title";
+        return nullptr;
+    }
+    FileSys::RomFSFactory factory(*loader, system.GetContentProvider(),
+                                  system.GetFileSystemController());
+    FileSys::VirtualFile update;
+    loader->ReadUpdateRaw(update);
+    factory.SetPackedUpdate(update);
+    auto root = FileSys::ExtractRomFS(factory.OpenCurrentProcess(title_id));
+    if (!root) {
+        error = "Cannot read the game's files (are the keys installed?)";
+    }
+    return root;
+}
+
+/// SHA-256 over every file's path, size and contents, in path order. Timestamps are not used.
+std::optional<std::string> HashTree(const FileSys::VirtualDir& root,
+                                    const std::function<void(size_t, size_t)>& progress,
+                                    std::stop_token stop) {
+    std::vector<ArchiveFile> files;
+    ListFiles(root, "", files);
+    std::ranges::sort(files, {}, &ArchiveFile::path);
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> hash(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!hash || EVP_DigestInit_ex(hash.get(), EVP_sha256(), nullptr) != 1) {
+        return std::nullopt;
+    }
+    std::vector<u8> buffer(1 << 20);
+    for (size_t i = 0; i < files.size(); ++i) {
+        progress(i, files.size());
+        const auto& item = files[i];
+        const u64 length = item.file->GetSize();
+        const u64 path_length = item.path.size();
+        EVP_DigestUpdate(hash.get(), &path_length, sizeof(path_length));
+        EVP_DigestUpdate(hash.get(), item.path.data(), item.path.size());
+        EVP_DigestUpdate(hash.get(), &length, sizeof(length));
+        for (u64 offset = 0; offset < length;) {
+            if (stop.stop_requested()) {
+                return std::nullopt;
+            }
+            const size_t wanted =
+                static_cast<size_t>(std::min<u64>(buffer.size(), length - offset));
+            if (item.file->Read(buffer.data(), wanted, offset) != wanted ||
+                EVP_DigestUpdate(hash.get(), buffer.data(), wanted) != 1) {
+                return std::nullopt;
+            }
+            offset += wanted;
+        }
+    }
+    std::array<u8, 32> digest{};
+    unsigned digest_size{};
+    if (EVP_DigestFinal_ex(hash.get(), digest.data(), &digest_size) != 1) {
+        return std::nullopt;
+    }
+    std::string result;
+    for (const u8 byte : digest) {
+        result += fmt::format("{:02x}", byte);
+    }
+    return result;
+}
+
+/// Turns the title's recipe into native-preparation.bin with the player's own game files. The
+/// Vulkan pipelines are built from it on the loading screen (PipelineCache::PreparePrecompiled).
+Result BuildNativeFiles(Core::System& system, const fs::path& game_path, u64 title_id,
+                        const BuildOptions& options,
+                        const std::function<void(const Progress&)>& progress,
+                        std::stop_token stop) {
+    Result result;
+    const auto report = [&](std::string_view stage, size_t done = 0, size_t total = 0) {
+        if (progress) {
+            progress(Progress{std::string(stage), done, total});
+        }
+    };
+    const auto fail = [&](std::string error) {
+        result.ok = false;
+        result.error = std::move(error);
+        LOG_WARNING(Render_Vulkan, "Native shader preparation for {:016x}: {}", title_id,
+                    result.error);
+        return result;
+    };
+    const auto dir = options.output_dir.empty() ? TitleDir(title_id) : options.output_dir;
+    const auto stored_recipe = dir / "native.nx2recipe";
+    const auto recipe_path = options.recipe_path.empty() ? stored_recipe : options.recipe_path;
+    try {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const auto size = fs::file_size(recipe_path, ec);
+        if (ec || size > 64 * 1024 * 1024) {
+            return fail("Cannot read the recipe, or it is larger than 64 MiB");
+        }
+        std::vector<u8> recipe(size);
+        std::ifstream input(recipe_path, std::ios::binary);
+        if (!input.read(reinterpret_cast<char*>(recipe.data()),
+                        static_cast<std::streamsize>(recipe.size()))) {
+            return fail("Cannot read the recipe");
+        }
+        const auto header = Nx2Recipe::ReadHeader(recipe);
+        if (!header) {
+            return fail("Not a Lichii precompile recipe; caches from other emulators are not "
+                        "supported");
+        }
+        if (header->title_id != title_id) {
+            return fail(fmt::format("The recipe is for title {:016X}", header->title_id));
+        }
+        if (header->cache_version != WarmCacheVersion) {
+            return fail(fmt::format("The recipe is for pipeline cache version {}; this build "
+                                    "uses {}",
+                                    header->cache_version, WarmCacheVersion));
+        }
+
+        report(StageNativeChecking);
+        std::string error;
+        const auto root = OpenEffectiveRomFS(system, game_path, title_id, error);
+        if (!root) {
+            return fail(error);
+        }
+        const auto tree = HashTree(
+            root, [&](size_t done, size_t total) { report(StageNativeChecking, done, total); },
+            stop);
+        if (stop.stop_requested()) {
+            return fail("Stopped");
+        }
+        if (!tree) {
+            return fail("Cannot read the game's files");
+        }
+        // Everything the assembled file depends on. The Vulkan journal has its own stamp.
+        const std::string stamp =
+            fmt::format("{:016x} {} {} {} {}", title_id, WarmCacheVersion,
+                        LICHII_PREPARATION_REVISION, *tree, ContentHash(recipe_path));
+        const auto source = dir / "native-source.txt";
+        const auto output = dir / "native-preparation.bin";
+        {
+            std::ifstream previous(source, std::ios::binary);
+            std::string old_stamp, old_content;
+            std::getline(previous, old_stamp);
+            std::getline(previous, old_content);
+            if (old_stamp == stamp && !old_content.empty() && ContentHash(output) == old_content) {
+                std::ifstream prepared(output, std::ios::binary);
+                u32 count{};
+                prepared.seekg(16);
+                prepared.read(reinterpret_cast<char*>(&count), sizeof(count));
+                result.ok = true;
+                result.native_pipelines = count;
+                report(StageNativeWriting, 1, 1);
+                return result;
+            }
+        }
+
+        report(StageNativeExtracting);
+        const std::array roots{root};
+        FileSys::Nx2ShaderExtract::Progress extract_progress;
+        const auto extracted =
+            FileSys::Nx2ShaderExtract::Extract(roots, 0, &extract_progress, stop);
+        if (stop.stop_requested()) {
+            return fail("Stopped");
+        }
+        result.native_programs = extracted.programs.size();
+        result.native_combinations = extracted.variations.size();
+
+        report(StageNativeAssembling);
+        const unsigned threads = static_cast<unsigned>(
+            options.threads != 0
+                ? options.threads
+                : std::clamp<size_t>(std::thread::hardware_concurrency() / 2, 2, 12));
+        Nx2Recipe::Report assembled_report;
+        const auto assembled = Nx2Recipe::Assemble(recipe, extracted, WarmCacheVersion,
+                                                   assembled_report, threads, stop);
+        if (stop.stop_requested()) {
+            return fail("Stopped");
+        }
+        result.native_pipelines = assembled_report.records;
+        result.native_dropped = assembled_report.records_dropped;
+        LOG_INFO(Render_Vulkan,
+                 "Native shader preparation for {:016x}: {} programs, {} combinations found; "
+                 "{} of the recipe's {} programs missing, {} not lowered; {} pipelines, {} "
+                 "dropped",
+                 title_id, extracted.programs.size(), extracted.variations.size(),
+                 assembled_report.programs_missing, assembled_report.programs,
+                 assembled_report.programs_failed, assembled_report.records,
+                 assembled_report.records_dropped);
+        if (assembled.empty() || assembled_report.records == 0) {
+            return fail("None of the recipe's pipelines match this copy of the game (another "
+                        "game version?)");
+        }
+
+        report(StageNativeWriting, 0, 1);
+        if (!AtomicWrite(output, assembled) ||
+            (recipe_path != stored_recipe && !AtomicWrite(stored_recipe, recipe))) {
+            return fail("Cannot write to " + Common::FS::PathToUTF8String(dir));
+        }
+        const std::string source_text = stamp + "\n" + ContentHash(output) + "\n";
+        if (!AtomicWrite(source, std::span(reinterpret_cast<const u8*>(source_text.data()),
+                                           source_text.size()))) {
+            return fail("Cannot write to " + Common::FS::PathToUTF8String(dir));
+        }
+        report(StageNativeWriting, 1, 1);
+        result.ok = true;
+        return result;
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    }
+}
+
+} // Anonymous namespace
+
 Result BuildWarmFiles(Core::System& system, const fs::path& game_path, u64 title_id,
                       const std::function<void(const Progress&)>& progress,
                       std::stop_token stop) {
@@ -446,10 +692,11 @@ Result BuildWarmFiles(Core::System& system, const fs::path& game_path, u64 title
                               std::move(stop));
 }
 
-Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 title_id,
-                          const BuildOptions& options,
-                          const std::function<void(const Progress&)>& progress,
-                          std::stop_token stop) {
+namespace {
+Result BuildComputeWarmFiles(Core::System& system, const fs::path& game_path, u64 title_id,
+                             const BuildOptions& options,
+                             const std::function<void(const Progress&)>& progress,
+                             std::stop_token stop) {
     Result result;
     const auto report = [&](std::string_view stage, size_t done, size_t total) {
         if (progress) {
@@ -648,6 +895,32 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
              "archive and {} member errors, {:.1f} s",
              title_id, result.compute_programs, result.skipped, archive_errors, member_errors,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    return result;
+}
+
+} // Anonymous namespace
+
+Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 title_id,
+                          const BuildOptions& options,
+                          const std::function<void(const Progress&)>& progress,
+                          std::stop_token stop) {
+    // The compute precache comes first; a recipe adds the native graphics and compute pipelines.
+    auto result = BuildComputeWarmFiles(system, game_path, title_id, options, progress, stop);
+    const auto dir = options.output_dir.empty() ? TitleDir(title_id) : options.output_dir;
+    std::error_code ec;
+    if ((options.recipe_path.empty() && !fs::exists(dir / "native.nx2recipe", ec)) ||
+        stop.stop_requested()) {
+        return result;
+    }
+    const auto native = BuildNativeFiles(system, game_path, title_id, options, progress, stop);
+    result.native_pipelines = native.native_pipelines;
+    result.native_programs = native.native_programs;
+    result.native_combinations = native.native_combinations;
+    result.native_dropped = native.native_dropped;
+    if (!native.ok) {
+        result.ok = false;
+        result.error = native.error;
+    }
     return result;
 }
 
