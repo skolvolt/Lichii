@@ -2049,11 +2049,14 @@ private:
         // With a frame rate limit other than 60 Hz the vsync event already paces the game; holding
         // its swap interval here as well kept it at 60 fps (interval 2 of a 120 Hz event). Only an
         // explicit FPS limit still applies then.
-        const bool timer_paced =
-            m_objects->movie_vsync.RateHz(system.CoreTiming().GetGlobalTimeUs().count(),
-                                          Nx2VsyncRateHz()) != 60;
+        const bool movie_playing =
+            m_objects->movie_vsync.Playing(system.CoreTiming().GetGlobalTimeUs().count());
+        const bool timer_paced = !movie_playing && Nx2VsyncRateHz() != 60;
         const bool speed_limited = !timer_paced && Settings::values.use_speed_limit.GetValue() &&
                                    Settings::SpeedLimit() != 0;
+        // nup: a movie plays at real speed: a speed limit over 100% (uncapped play) would pace
+        // its 60 Hz vblanks 3x fast and run the game's movie timeline (narration) ahead again.
+        const u32 pace_speed = movie_playing ? 100 : Settings::SpeedLimit();
         if (!speed_limited && fps_limit == 0) {
             return;
         }
@@ -2066,7 +2069,7 @@ private:
             timer_paced ? std::chrono::nanoseconds{0}
                         : std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
                                                    refresh_rate /
-                                                   (speed_limited ? Settings::SpeedLimit() : 100)};
+                                                   (speed_limited ? pace_speed : 100)};
         const auto interval = PacedInterval(vblank_interval, fps_limit);
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
