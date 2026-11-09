@@ -99,6 +99,7 @@ protected:
     /// Periodic changer of titlebar (independent of event loop)
     SDL_TimerID titlebar_timer;
     std::atomic<std::string*> pending_title{};
+    std::string game_name; ///< Read and used by the titlebar timer only
 
     // Mouse resetter once it
     SDL_TimerID mouse_timer;

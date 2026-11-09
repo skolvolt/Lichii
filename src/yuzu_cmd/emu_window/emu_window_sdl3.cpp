@@ -19,6 +19,7 @@
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/loader/loader.h"
 #include "core/perf_stats.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
@@ -39,7 +40,14 @@ EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Co
     titlebar_timer = SDL_AddTimer(2000, [](void *userdata, SDL_TimerID, Uint32) -> Uint32 {
         auto* this_ = (EmuWindow_SDL3*)userdata;
         auto const results = this_->system.GetAndResetPerfStats();
-        auto* const title = new std::string(fmt::format("{} | {}-{} | FPS: {:.0f} ({:.0f}%)", Common::g_build_fullname, Common::g_scm_branch, Common::g_scm_desc, results.average_game_fps, results.emulation_speed * 100.0f));
+        // The game's name once it has loaded; the build is on the log's first line.
+        if (this_->game_name.empty() &&
+            this_->system.GetGameName(this_->game_name) != Loader::ResultStatus::Success) {
+            this_->game_name.clear();
+        }
+        auto* const title = new std::string(fmt::format(
+            "{} | {:.0f} FPS ({:.0f}%)", this_->game_name.empty() ? "Lichii" : this_->game_name,
+            results.average_game_fps, results.emulation_speed * 100.0f));
         // Timers run on their own thread and AppKit throws when a title is set off the main
         // thread: ApplyPendingTitle sets it from the main loop.
         delete this_->pending_title.exchange(title);

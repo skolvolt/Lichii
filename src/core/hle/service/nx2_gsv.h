@@ -72,6 +72,7 @@
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
+#include "core/hle/service/nx2_movie_vsync.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
@@ -1531,6 +1532,7 @@ struct Nx2NativeObjects {
     std::map<u32, Memory> memories;
     std::map<u32, Image> images;
     std::optional<VideoTrace> last_video_write;
+    Nx2MovieVsync movie_vsync; ///< Decoders mark movie frames, the vi2 vsync event reads it
     u32 next_memory{1};
     u32 next_image{1};
 
@@ -2047,7 +2049,9 @@ private:
         // With a frame rate limit other than 60 Hz the vsync event already paces the game; holding
         // its swap interval here as well kept it at 60 fps (interval 2 of a 120 Hz event). Only an
         // explicit FPS limit still applies then.
-        const bool timer_paced = Nx2VsyncRateHz() != 60;
+        const bool timer_paced =
+            m_objects->movie_vsync.RateHz(system.CoreTiming().GetGlobalTimeUs().count(),
+                                          Nx2VsyncRateHz()) != 60;
         const bool speed_limited = !timer_paced && Settings::values.use_speed_limit.GetValue() &&
                                    Settings::SpeedLimit() != 0;
         if (!speed_limited && fps_limit == 0) {
@@ -2550,24 +2554,33 @@ private:
 
     void StartVsyncTimer() {
         if (!m_vsync_timer) {
-            // The game starts frames on this event, so its rate is the frame rate limit.
+            // The game starts frames on this event, so its rate is the frame rate limit, except
+            // while a movie plays (Nx2MovieVsync).
             const u32 vsync_hz = Nx2VsyncRateHz();
             const std::chrono::nanoseconds VblankInterval{1'000'000'000LL / vsync_hz};
             LOG_INFO(Service, "nx2:vi2 vsync rate: {} Hz", vsync_hz);
+            m_vsync->rate_hz = vsync_hz;
             m_vsync_timer = Core::Timing::CreateEvent(
                 "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel(), VblankInterval](
+                [vsync_state = m_vsync, objects = m_objects, &kernel = system.Kernel(), vsync_hz](
                     s64 scheduled,
                     std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
+                    const u32 rate_hz =
+                        objects->movie_vsync.RateHz((scheduled + late.count()) / 1000, vsync_hz);
+                    if (rate_hz != std::exchange(vsync_state->rate_hz, rate_hz)) {
+                        LOG_INFO(Service, "nx2:vi2 vsync rate: {} Hz{}", rate_hz,
+                                 rate_hz != vsync_hz ? " while a movie plays" : "");
+                    }
+                    const std::chrono::nanoseconds interval{1'000'000'000LL / rate_hz};
                     if (Common::DkbFrameTrace::Enabled()) {
                         const s64 observed = scheduled + late.count();
                         ++vsync_state->trace_callbacks;
                         vsync_state->trace_late_callbacks +=
-                            VblankInterval.count() > 0 && late >= VblankInterval;
+                            interval.count() > 0 && late >= interval;
                         vsync_state->trace_max_late =
                             (std::max)(vsync_state->trace_max_late, late.count());
                         if (vsync_state->trace_last_callback) {
@@ -2583,7 +2596,7 @@ private:
                                      "observed_global_ns={} guest_ticks={}",
                                      vsync_state->trace_present.load(std::memory_order_relaxed),
                                      vsync_state->trace_callbacks, vsync_state->events.size(),
-                                     VblankInterval.count(), vsync_state->trace_late_callbacks,
+                                     interval.count(), vsync_state->trace_late_callbacks,
                                      vsync_state->trace_max_late,
                                      vsync_state->trace_min_gap.value_or(-1), observed,
                                      kernel.System().CoreTiming().GetClockTicks());
@@ -2593,7 +2606,7 @@ private:
                             vsync_state->trace_min_gap.reset();
                         }
                     }
-                    return std::nullopt;
+                    return interval;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }
@@ -2607,6 +2620,7 @@ private:
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        u32 rate_hz{}; ///< Current event rate, to log changes
         Common::DkbFrameTrace::RateLimit trace_rate;
         std::optional<s64> trace_last_callback, trace_min_gap;
         s64 trace_max_late{};
@@ -3170,6 +3184,7 @@ private:
                 }
                 ++m_frames_out;
                 const s64 written_us = HostTimeUs();
+                m_objects->movie_vsync.FrameWritten(written_us, height);
                 if (!m_stream_start) {
                     m_stream_start = {written_us, frame.pts};
                 }

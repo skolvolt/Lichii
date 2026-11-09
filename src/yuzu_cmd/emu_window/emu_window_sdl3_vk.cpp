@@ -22,12 +22,9 @@
 EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsystem_,
                                      Core::System& system_, bool fullscreen)
     : EmuWindow_SDL3{input_subsystem_, system_} {
-    const std::string window_title = fmt::format("Eden {} | {}-{} (Vulkan)",
-                                                 Common::g_build_name,
-                                                 Common::g_scm_branch,
-                                                 Common::g_scm_desc);
+    // The titlebar timer names the game once it has loaded.
     render_window =
-        SDL_CreateWindow(window_title.c_str(), Layout::ScreenUndocked::Width,
+        SDL_CreateWindow("Lichii", Layout::ScreenUndocked::Width,
                          Layout::ScreenUndocked::Height,
                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | Nx2HiddenWindowFlags());
 

@@ -4934,6 +4934,8 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
     if (title_name.empty()) {
         title_name = fmt::format("{:016X}", program_id);
     }
+    // While it runs, UpdateStatusBar titles the window "<game> | <fps> FPS (<speed>%)".
+    running_title_name = title_name;
 
     if (const auto* process = QtCommon::system->Kernel().ApplicationProcess(); process != nullptr) {
         const auto instruction_set_suffix = process->Is64Bit() ? tr("(64-bit)") : tr("(32-bit)");
@@ -4961,6 +4963,7 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
                     std::string{Common::g_compiler_id});
 
     if (title_name.empty()) {
+        running_title_name.clear();
         setWindowTitle(QString::fromStdString(window_title));
     } else {
         const auto run_title = [window_title, title_name, title_version, gpu_vendor]() {
@@ -5069,6 +5072,11 @@ void MainWindow::UpdateStatusBar() {
         fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
 
     game_fps_label->setText(fpsText);
+    if (!running_title_name.empty()) {
+        setWindowTitle(QString::fromStdString(
+            fmt::format("{} | {:.0f} FPS ({:.0f}%)", running_title_name,
+                        std::round(results.average_game_fps), results.emulation_speed * 100.0)));
+    }
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
 
