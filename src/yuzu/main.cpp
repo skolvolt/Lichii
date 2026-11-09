@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
+#include <string>
+
 #include <QApplication>
 
 #include "common/fs/fs_paths.h"
@@ -83,6 +86,31 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+    // nup (after Fritchii v5.5): NVIDIA's driver shader cache must hold Ocarina's ~120,000
+    // prepared pipelines (#1021); its default size evicts most of them. The driver reads these
+    // variables for this process only. EDEN_NX2_NV_SHADER_CACHE_GB (default 10, 0 = leave the
+    // driver's default) and EDEN_NX2_NV_SHADER_CACHE_PATH (default: the driver's own folder).
+    // A value already in the environment wins.
+    {
+        const auto set_default = [](const char* name, const std::string& value) {
+            if (!value.empty() && std::getenv(name) == nullptr) {
+#ifdef _WIN32
+                _putenv_s(name, value.c_str());
+#else
+                setenv(name, value.c_str(), 0);
+#endif
+            }
+        };
+        const char* const gb_text = std::getenv("EDEN_NX2_NV_SHADER_CACHE_GB");
+        const unsigned long long gb = gb_text ? std::strtoull(gb_text, nullptr, 10) : 10ULL;
+        if (gb != 0) {
+            set_default("__GL_SHADER_DISK_CACHE_SIZE", std::to_string(gb << 30));
+            set_default("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
+        }
+        if (const char* const path = std::getenv("EDEN_NX2_NV_SHADER_CACHE_PATH")) {
+            set_default("__GL_SHADER_DISK_CACHE_PATH", path);
+        }
+    }
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {
