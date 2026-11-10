@@ -7,6 +7,7 @@
 #pragma once
 
 #include "video_core/buffer_cache/uniform_cache_history.h"
+#include "video_core/nx2_debug_control.h"
 
 #include <algorithm>
 #include <cstring>
