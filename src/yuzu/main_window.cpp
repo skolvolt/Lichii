@@ -140,6 +140,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
+#include "common/skitchii_version.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
 
@@ -449,11 +450,17 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     show();
 
 #ifdef ENABLE_UPDATE_CHECKER
-    if (UISettings::values.check_for_updates) {
-        update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
-        update_watcher.connect(&update_watcher, &QFutureWatcher<QString>::finished, this,
-                               &MainWindow::OnEmulatorUpdateAvailable);
-        update_watcher.setFuture(update_future);
+    connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
+            &MainWindow::OnEmulatorUpdateAvailable);
+    // A swap that a crash interrupted is finished or undone before anything else.
+    if (!Updater::FinishPendingSwap(this)) {
+        if (auto note = Updater::TakeRestartNote()) {
+            restart_note = std::move(*note);
+            QTimer::singleShot(0, this, &MainWindow::ShowRestartNote);
+        }
+        if (UISettings::values.check_for_updates) {
+            StartUpdateCheck(false);
+        }
     }
 #endif
 
@@ -1689,62 +1696,22 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
 
-#if defined(ENABLE_UPDATE_CHECKER) && (defined(__linux__) || defined(_WIN32))
-    auto* restore_action = ui->menu_Help->addAction(tr("Restore Previous Version..."));
-    restore_action->setVisible(false);
-#ifdef __linux__
-    const auto previous_version = [] {
-        const std::filesystem::path target{qEnvironmentVariable("APPIMAGE").toStdString()};
-        std::error_code ec;
-        return !target.empty() && std::filesystem::is_regular_file(
-                                      UpdateInstaller::PreviousPath(target), ec)
-                   ? target
-                   : std::filesystem::path{};
-    };
-#else
-    const auto previous_version = [] {
-        const std::filesystem::path backup =
-            std::filesystem::path{QCoreApplication::applicationDirPath().toStdWString()} /
-            UpdateInstaller::BackupName;
-        std::error_code ec;
-        return std::filesystem::is_directory(backup, ec) ? backup : std::filesystem::path{};
-    };
-#endif
-    connect(ui->menu_Help, &QMenu::aboutToShow, restore_action,
-            [restore_action, previous_version] {
-                restore_action->setVisible(!previous_version().empty());
-            });
-    connect(restore_action, &QAction::triggered, this, [this, previous_version] {
-        const auto previous = previous_version();
-        if (previous.empty()) {
-            return;
+#ifdef ENABLE_UPDATE_CHECKER
+    auto* check_action = new QAction(tr("Check for Updates..."), this);
+    ui->menu_Help->insertAction(ui->action_About, check_action);
+    connect(check_action, &QAction::triggered, this, &MainWindow::OnCheckForUpdates);
+
+    auto* rollback_action = new QAction(tr("Roll Back to the Previous Version..."), this);
+    rollback_action->setVisible(false);
+    ui->menu_Help->insertAction(ui->action_About, rollback_action);
+    connect(ui->menu_Help, &QMenu::aboutToShow, this, [this, rollback_action] {
+        rollback_action->setVisible(Updater::RollbackVersion().has_value());
+        rollback_action->setEnabled(!emulation_running && !boot_in_progress);
+    });
+    connect(rollback_action, &QAction::triggered, this, [this] {
+        if (!emulation_running && !boot_in_progress) {
+            Updater::RollBack(this);
         }
-        const auto answer = QtCommon::Frontend::Question(
-            tr("Restore Previous Version"),
-            tr("Go back to the version this one replaced? Your settings and data are not "
-               "changed."),
-            QtCommon::Frontend::Yes | QtCommon::Frontend::No);
-        if (answer != QtCommon::Frontend::Yes) {
-            return;
-        }
-#ifdef __linux__
-        const UpdateInstaller::Lock lock{UpdateInstaller::LockPath(previous)};
-        std::error_code ec;
-        if (!lock.Held()) {
-            ec = std::make_error_code(std::errc::device_or_resource_busy);
-        }
-        if (!lock.Held() || !UpdateInstaller::Rollback(previous, ec)) {
-            LOG_ERROR(Frontend, "Could not restore the previous version: {}", ec.message());
-            QtCommon::Frontend::Critical(tr("Failed to restore"),
-                                         tr("Could not restore the previous version: %1")
-                                             .arg(QString::fromStdString(ec.message())));
-            return;
-        }
-        LOG_INFO(Frontend, "Restored the previous version of {}", previous.string());
-        UpdateDialog::Restart(this, QString::fromStdString(previous.string()));
-#else
-        UpdateDialog::LaunchInstaller(this, QString::fromStdWString(previous.wstring()));
-#endif
     });
 #endif
 }
@@ -2457,6 +2424,14 @@ void MainWindow::OnEmulationStopped() {
     if (!emulation_running) {
         return;
     }
+#ifdef ENABLE_UPDATE_CHECKER
+    // A deferred update is offered once this function has finished stopping the game.
+    QTimer::singleShot(0, this, [this] {
+        if (!emulation_running) {
+            OfferPendingUpdate();
+        }
+    });
+#endif
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         return;
     }
@@ -4895,33 +4870,107 @@ void MainWindow::OnCaptureScreenshot() {
 }
 
 #ifdef ENABLE_UPDATE_CHECKER
-void MainWindow::OnEmulatorUpdateAvailable() {
-    const auto result = update_future.result();
-    if (result.failure == UpdateChecker::Failure::RateLimited) {
-        statusBar()->showMessage(
-            tr("Could not check for updates: GitHub rate limit reached. Lichii will try again at "
-               "the next start."),
-            15000);
+// Ported from Fritchii v5.6. nup: a release that can be installed in place (published SHA-256,
+// writable folder) is installed straight away, without asking: the dialog shows the download and
+// install progress, then Skitchii restarts. Never while a game runs (offered when it closes).
+void MainWindow::StartUpdateCheck(bool manual) {
+    if (update_watcher.isRunning()) {
+        update_check_manual |= manual;
         return;
     }
-    if (result.failure == UpdateChecker::Failure::Http) {
-        statusBar()->showMessage(
-            tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status),
-            15000);
+    update_check_manual = manual;
+    update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
+    update_watcher.setFuture(update_future);
+}
+
+void MainWindow::OnCheckForUpdates() {
+    StartUpdateCheck(true);
+}
+
+void MainWindow::OnEmulatorUpdateAvailable() {
+    const auto result = update_future.result();
+    const bool manual = std::exchange(update_check_manual, false);
+    if (result.failure != UpdateChecker::Failure::None) {
+        QString text;
+        switch (result.failure) {
+        case UpdateChecker::Failure::RateLimited:
+            text = tr("Could not check for updates: GitHub rate limit reached. Skitchii will try "
+                      "again at the next start.");
+            break;
+        case UpdateChecker::Failure::Http:
+            text =
+                tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status);
+            break;
+        default:
+            text = tr("Could not check for updates. Check your internet connection.");
+            break;
+        }
+        // The check at startup stays quiet when offline.
+        if (manual) {
+            QMessageBox::warning(this, tr("Check for Updates"), text);
+        } else if (result.failure != UpdateChecker::Failure::Network) {
+            statusBar()->showMessage(text, 15000);
+        }
         return;
     }
     if (!result.update) {
+        if (manual) {
+            QMessageBox::information(this, tr("Check for Updates"),
+                                     tr("You have the latest version (Skitchii v%1).")
+                                         .arg(QString::fromLatin1(Common::SkitchiiVersion.data(),
+                                                                  static_cast<qsizetype>(
+                                                                      Common::SkitchiiVersion.size()))));
+        }
         return;
     }
 
     const auto& release = *result.update;
     const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
-    if (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
-        UISettings::values.update_remind_at.GetValue() > now) {
+    if (!manual && (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
+                    UISettings::values.update_remind_at.GetValue() > now)) {
         return;
     }
+    pending_update = result;
+    if (emulation_running || boot_in_progress) {
+        statusBar()->showMessage(tr("%1 is available. It will be installed when the game closes.")
+                                     .arg(QString::fromStdString(release.title)),
+                                 15000);
+        return;
+    }
+    OfferPendingUpdate();
+}
 
-    UpdateDialog dialog(release, this);
+void MainWindow::OfferPendingUpdate() {
+    if (!pending_update || close_pending || emulation_running || boot_in_progress) {
+        // OnEmulationStopped offers it once the game is closed.
+        return;
+    }
+    // Wait for other dialogs to be answered.
+    if (QApplication::activeModalWidget() != nullptr) {
+        QTimer::singleShot(1000, this, &MainWindow::OfferPendingUpdate);
+        return;
+    }
+    const auto result = std::move(*pending_update);
+    pending_update.reset();
+    ShowUpdate(result);
+}
+
+void MainWindow::ShowRestartNote() {
+    if (QApplication::activeModalWidget() != nullptr) {
+        QTimer::singleShot(1000, this, &MainWindow::ShowRestartNote);
+        return;
+    }
+    QMessageBox::information(this, tr("Skitchii"), restart_note);
+}
+
+void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {
+    const auto& release = *result.update;
+    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
+    UpdateDialog dialog(release, result.asset, this);
+    if (dialog.CanAutoInstall()) {
+        // Auto-install: accept as soon as the dialog shows (download, verify, swap, restart).
+        QTimer::singleShot(0, &dialog, &QDialog::accept);
+    }
     switch (dialog.exec()) {
     case UpdateDialog::SkipVersion:
         UISettings::values.skipped_update_tag = release.tag;
@@ -4980,9 +5029,10 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
-    // nup: this build is shared as "Skitchii v1.2" (based on Lichii).
+    // nup: this build is shared as "Skitchii v<SkitchiiVersion>" (based on Lichii).
     const std::string window_title =
-        fmt::format("Skitchii v1.2 (Lichii {}) | {}", std::string{Common::g_build_version},
+        fmt::format("Skitchii v{} (Lichii {}) | {}", Common::SkitchiiVersion,
+                    std::string{Common::g_build_version},
                     std::string{Common::g_compiler_id});
 
     if (title_name.empty()) {

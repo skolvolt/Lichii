@@ -6,6 +6,9 @@
 
 #include <QApplication>
 
+#ifdef ENABLE_UPDATE_CHECKER
+#include "yuzu/updater/update_dialog.h"
+#endif
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "nx2_switches.h"
@@ -85,6 +88,10 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef ENABLE_UPDATE_CHECKER
+    // Before the switches are added to the environment, which a restart must not inherit.
+    Updater::PrepareLaunch();
+#endif
     LoadNx2Switches(argv[0]);
     // nup (after Fritchii v5.5): NVIDIA's driver shader cache must hold Ocarina's ~120,000
     // prepared pipelines (#1021); its default size evicts most of them. The driver reads these

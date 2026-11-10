@@ -454,6 +454,11 @@ private slots:
 
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
+    void StartUpdateCheck(bool manual);
+    void OnCheckForUpdates();
+    void OfferPendingUpdate();
+    void ShowRestartNote();
+    void ShowUpdate(const UpdateChecker::CheckResult& result);
 #endif
 
 private:
@@ -513,6 +518,9 @@ private:
 #ifdef ENABLE_UPDATE_CHECKER
     QFuture<UpdateChecker::CheckResult> update_future;
     QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
+    bool update_check_manual{};
+    std::optional<UpdateChecker::CheckResult> pending_update; ///< Offered when the game closes
+    QString restart_note;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
