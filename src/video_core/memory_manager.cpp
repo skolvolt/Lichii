@@ -17,6 +17,7 @@
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
@@ -269,6 +270,30 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         return std::nullopt;
     }
+    // The same few pages are looked up over and over (every draw rebinds its buffers and
+    // textures): a small per-thread cache of page translations, dropped whenever any entry
+    // changes (map_serial moves after each map or unmap). EDEN_NX2_NO_TRANSLATION_CACHE=1
+    // turns it off (Eglantine b1e650849e by kraibse: back thread 13.64 -> 13.25 ms a frame).
+    struct CachedPage {
+        u64 owner;
+        u64 serial;
+        u64 page;
+        u64 device_page;
+    };
+    static constexpr size_t CacheSize = 2048;
+    static thread_local std::array<CachedPage, CacheSize> cache{};
+    // Fritchii: EDEN_NX2_EXP63 (live, 0 = off) instead, so a fight session can flip it.
+    const bool use_cache = std::getenv("EDEN_NX2_NO_TRANSLATION_CACHE") == nullptr &&
+                           VideoCore::Nx2Debug::Experiment(63) != 0;
+    constexpr u64 SubpageBits = 12;
+    constexpr u64 SubpageMask = (u64{1} << SubpageBits) - 1;
+    const u64 owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
+    const u64 page = gpu_addr >> SubpageBits;
+    const u64 serial = map_serial.load(std::memory_order_acquire);
+    CachedPage& slot = cache[(page ^ (page >> 11)) % CacheSize];
+    if (use_cache && slot.owner == owner_id && slot.page == page && slot.serial == serial) [[likely]] {
+        return slot.device_page + (gpu_addr & SubpageMask);
+    }
     DAddr dev_addr;
     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
         if (GetEntry(gpu_addr, false) != EntryType::Mapped)
@@ -283,6 +308,9 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
         LOG_ERROR(HW_GPU, "GPU address {:#x} maps outside the device space, to {:#x}", gpu_addr,
                   dev_addr);
         return std::nullopt;
+    }
+    if (use_cache) {
+        slot = CachedPage{owner_id, serial, page, dev_addr - (gpu_addr & SubpageMask)};
     }
     return dev_addr;
 }
