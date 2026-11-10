@@ -283,8 +283,10 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     static constexpr size_t CacheSize = 2048;
     static thread_local std::array<CachedPage, CacheSize> cache{};
     // Fritchii: EDEN_NX2_EXP63 (live, 0 = off) instead, so a fight session can flip it.
-    const bool use_cache = std::getenv("EDEN_NX2_NO_TRANSLATION_CACHE") == nullptr &&
-                           VideoCore::Nx2Debug::Experiment(63) != 0;
+    // The environment is read once: getenv takes the C runtime's lock, and this runs millions of
+    // times a second (a per-call getenv here made Castle Town run at 3 fps, 2026-11-10).
+    static const bool cache_allowed = std::getenv("EDEN_NX2_NO_TRANSLATION_CACHE") == nullptr;
+    const bool use_cache = cache_allowed && VideoCore::Nx2Debug::Experiment(63) != 0;
     constexpr u64 SubpageBits = 12;
     constexpr u64 SubpageMask = (u64{1} << SubpageBits) - 1;
     const u64 owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
