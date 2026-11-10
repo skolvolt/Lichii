@@ -192,6 +192,7 @@ public:
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
+        ++record_serial;
         if (chunk->Record(command)) {
             return;
         }
@@ -206,6 +207,12 @@ public:
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    /// Whether a command was recorded since the last Flush or Finish (EXP61: a flush with nothing
+    /// to submit is skipped).
+    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
+        return record_serial != submitted_serial;
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -322,6 +329,8 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    u64 record_serial{};    ///< Commands recorded (RecordWithUploadBuffer)
+    u64 submitted_serial{}; ///< record_serial at the last Flush or Finish
 
     class Command {
     public:

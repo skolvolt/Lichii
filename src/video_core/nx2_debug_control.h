@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -17,6 +18,14 @@
 /// them at the end of each presented frame, so every cache they touch is used from its owner.
 /// Without the server nothing is posted and the per-frame cost is one relaxed atomic load.
 namespace VideoCore::Nx2Debug {
+
+/// nup: a whole-number switch EDEN_NX2_<name> (environment or nx2_switches.txt), `fallback` when
+/// unset. Read it into a function-local static on first use: the frontend applies
+/// nx2_switches.txt before emulation starts. Ports of Fritchii's EDEN_NX2_EXPn get their own names.
+[[nodiscard]] inline int NupSwitch(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::atoi(value) : fallback;
+}
 
 struct CaptureRequest {
     u64 id;

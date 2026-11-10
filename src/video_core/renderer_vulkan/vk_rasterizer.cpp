@@ -2562,6 +2562,14 @@ void RasterizerVulkan::FlushCommands() {
     }
     draw_counter = 0;
     pending_native_work = false;
+    // EDEN_NX2_SKIP_EMPTY_SUBMITS (default 1; Fritchii EXP61): nothing recorded since the last submit.
+    // A fence with a download is flushed by InnerFence::Queue and then again here with an empty
+    // command buffer: ~4,600 empty submits a second in Castle Town (fable52_answer_8 s8).
+    static const bool skip_empty_submits =
+        VideoCore::Nx2Debug::NupSwitch("EDEN_NX2_SKIP_EMPTY_SUBMITS", 1) != 0;
+    if (skip_empty_submits && !scheduler.RecordedSinceSubmit()) {
+        return;
+    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {
