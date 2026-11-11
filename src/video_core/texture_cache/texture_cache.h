@@ -149,10 +149,11 @@ void TextureCache<P>::SweepSuperseded() {
     // so nothing reads the old contents. Such images were kept until the collector reached them
     // near the memory budget, then downloaded first (a full GPU wait each) or made room by
     // evicting live textures. Fritchii's EXP58 (Castle Town: device memory 7.8-10.5 -> 5.2-5.7
-    // GB, worst frames 140-180 -> 30-48 ms). EDEN_NX2_SWEEP_SUPERSEDED=0 turns it off.
+    // GB, worst frames 140-180 -> 30-48 ms). Off by default (Castle Town 4+4 runs: +3% within noise,
+    // peak VRAM unchanged); EDEN_NX2_SWEEP_SUPERSEDED=1 turns it on.
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_SWEEP_SUPERSEDED");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     constexpr u64 SupersededFrames = 60;
     if (!enabled || frame_tick < SupersededFrames || frame_tick % 30 != 0) {
