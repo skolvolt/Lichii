@@ -33,20 +33,24 @@ public:
         Stop();
     }
 
-    bool Add(const Key& key, size_t capture_bytes, Build build) {
-        if (started || stopped || entries.contains(key) ||
-            capture_bytes > capture_limit - captured_bytes) {
-            return false;
-        }
-        auto reservation = budget.TryAcquire(true);
-        if (!reservation) {
-            return false;
+    /// nup: `reserve` = false (follow-on builds, which read their record when they run) takes no
+    /// emission slot, and an Add after Start queues the build at once.
+    bool Add(const Key& key, size_t capture_bytes, Build build, bool reserve = true) {
+        std::unique_ptr<EmissionBudget::Reservation> reservation;
+        {
+            std::scoped_lock lock{mutex};
+            if (stopped || entries.contains(key) ||
+                capture_bytes > capture_limit - captured_bytes) {
+                return false;
+            }
+            if (reserve && !(reservation = budget.TryAcquire(true))) {
+                return false;
+            }
         }
         auto entry = std::make_shared<Entry>();
         entry->reservation = std::move(reservation);
-        entries.emplace(key, entry);
         captured_bytes += capture_bytes;
-        tasks.emplace_back([this, key, entry, build = std::move(build)]() mutable {
+        Common::UniqueFunction<void> task([this, key, entry, build = std::move(build)]() mutable {
             bool run;
             {
                 std::scoped_lock lock{mutex};
@@ -73,11 +77,20 @@ public:
                 }
             }
         });
+        std::scoped_lock lock{mutex};
+        entries.emplace(key, entry);
+        if (started) {
+            workers->QueueWork(std::move(task));
+        } else {
+            tasks.push_back(std::move(task));
+        }
         return true;
     }
 
     void Start(size_t threads) {
-        if (started || stopped || tasks.empty() || threads == 0) {
+        // nup: starts without tasks too: follow-on builds are added while playing.
+        std::scoped_lock lock{mutex};
+        if (started || stopped || threads == 0) {
             return;
         }
         started = true;

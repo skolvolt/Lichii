@@ -382,6 +382,21 @@ private:
     std::chrono::steady_clock::time_point used_pipelines_saved{};
     void SaveUsedPipelines();
 
+    /// nup: follow-on prebuild. <title>/vulkan_order.bin holds key hashes in the order sessions
+    /// first used them; a pipeline's first use this session prebuilds, in the background, the
+    /// cached pipelines skipped at boot that came right after it last time (what the game is
+    /// about to draw), instead of building the whole cache up front.
+    void FollowOn(u64 hash);
+    std::filesystem::path order_filename;
+    std::vector<u64> last_order;
+    std::unordered_map<u64, u32> last_order_index;
+    std::vector<u64> first_use_order;
+    /// Skipped at boot: key hash -> (key, where its record begins in the disk cache)
+    std::unordered_map<u64, std::pair<GraphicsPipelineCacheKey, u64>> skipped_records;
+    size_t follow_on_queued{};
+    size_t follow_on_taken{};
+    size_t built_on_demand{};
+
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};

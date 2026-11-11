@@ -949,6 +949,76 @@ void PipelineCache::SaveUsedPipelines() {
         file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
         file.write(reinterpret_cast<const char*>(&age), sizeof(age));
     }
+    // This session's first uses, then the earlier order for the pipelines it didn't reach.
+    std::ofstream order{order_filename, std::ios::binary | std::ios::trunc};
+    const std::unordered_set<u64> seen(first_use_order.begin(), first_use_order.end());
+    for (const u64 hash : first_use_order) {
+        order.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+    }
+    for (const u64 hash : last_order) {
+        if (!seen.contains(hash)) {
+            order.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Follow-on prebuild: {} queued, {} taken prebuilt, {} built on demand",
+             follow_on_queued, follow_on_taken, built_on_demand);
+}
+
+void PipelineCache::FollowOn(u64 hash) {
+    first_use_order.push_back(hash);
+    // EDEN_NX2_FOLLOW_ON=N: how far ahead of a first use to prebuild (0 = off).
+    static const size_t ahead = [] {
+        const char* value = std::getenv("EDEN_NX2_FOLLOW_ON");
+        return value ? static_cast<size_t>(std::max(std::atoi(value), 0)) : size_t{32};
+    }();
+    const auto it = last_order_index.find(hash);
+    if (ahead == 0 || it == last_order_index.end()) {
+        return;
+    }
+    const size_t end = std::min(last_order.size(), it->second + 1 + ahead);
+    for (size_t i = it->second + 1; i < end; ++i) {
+        auto node = skipped_records.extract(last_order[i]);
+        if (node.empty()) {
+            continue;
+        }
+        const auto [key, begin] = node.mapped();
+        if (background_pipelines.Add(
+                key, 0,
+                [this, key, begin, path = pipeline_cache_filename]() -> std::unique_ptr<GraphicsPipeline> {
+                    std::ifstream file{path, std::ios::binary};
+                    file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+                    file.seekg(0, std::ios::end);
+                    const std::streampos file_end = file.tellg();
+                    file.seekg(static_cast<std::streamoff>(begin));
+                    u32 num_envs{};
+                    file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                    if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
+                        return {};
+                    }
+                    std::vector<FileEnvironment> envs(num_envs);
+                    boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram>
+                        env_ptrs;
+                    for (auto& env : envs) {
+                        env.Deserialize(file, file_end);
+                        env_ptrs.push_back(&env);
+                    }
+                    // A rewrite after the load moves records: build only the record still there.
+                    GraphicsPipelineCacheKey stored;
+                    file.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+                    if (stored.unique_hashes != key.unique_hashes) {
+                        return {};
+                    }
+                    ShaderPools pools;
+                    auto pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
+                    if (pipeline && pipeline->Failed()) {
+                        return {};
+                    }
+                    return pipeline;
+                },
+                false)) {
+            ++follow_on_queued;
+        }
+    }
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
@@ -1237,6 +1307,29 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
+    order_filename = VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_order", CACHE_VERSION);
+    last_order.clear();
+    last_order_index.clear();
+    first_use_order.clear();
+    skipped_records.clear();
+    {
+        std::ifstream order{order_filename, std::ios::binary};
+        for (u64 hash; order.read(reinterpret_cast<char*>(&hash), sizeof(hash));) {
+            if (last_order_index.try_emplace(hash, static_cast<u32>(last_order.size())).second) {
+                last_order.push_back(hash);
+            }
+        }
+    }
+    // nup: EDEN_NX2_BOOT_AGE=N builds at boot only the pipelines used in the last N sessions
+    // (default all 16 kept); follow-on prebuild covers the rest as the game gets near them.
+    static const u8 boot_age = [] {
+        const char* value = std::getenv("EDEN_NX2_BOOT_AGE");
+        return value ? static_cast<u8>(std::clamp(std::atoi(value), 0, 255)) : u8{255};
+    }();
+    const auto used_at_boot = [this](u64 hash) {
+        const auto it = used_pipelines.find(hash);
+        return it != used_pipelines.end() && it->second < boot_age;
+    };
     size_t skipped_pipelines = 0;
     size_t deferred_pipelines = 0;
     size_t queued_graphics = 0;
@@ -1398,8 +1491,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!PreloadAllPipelines() &&
             (used_pipelines.empty()
                  ? queued_graphics >= MaxPipelinesWithoutUsedList
-                 : !used_pipelines.contains(hash) && !used_pipelines.contains(stored_hash))) {
+                 : !used_at_boot(hash) && !used_at_boot(stored_hash))) {
             ++skipped_pipelines;
+            skipped_records.try_emplace(hash, key, record.begin);
             size_t capture_bytes = (envs.capacity() - envs.size()) * sizeof(FileEnvironment);
             for (const auto& env : envs) {
                 capture_bytes += env.MemorySize();
@@ -2824,7 +2918,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
         pipeline = background_pipelines.Take(graphics_key);
-        if (!pipeline) {
+        if (pipeline) {
+            ++follow_on_taken;
+        } else {
+            ++built_on_demand;
             pipeline = CreateGraphicsPipeline();
         }
     }
@@ -2832,9 +2929,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         return nullptr;
     }
     constexpr auto save_interval = std::chrono::seconds{15};
-    if (used_this_session.insert(pipeline.get()).second &&
-        std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) {
-        SaveUsedPipelines();
+    if (used_this_session.insert(pipeline.get()).second) {
+        FollowOn(graphics_key.Hash());
+        if (std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) {
+            SaveUsedPipelines();
+        }
     }
     if (current_pipeline) {
         current_pipeline->AddTransition(pipeline.get());
