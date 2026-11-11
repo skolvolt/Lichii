@@ -6,6 +6,9 @@
 
 #include <chrono>
 #include <thread>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -110,8 +113,27 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         const char* v = std::getenv("EDEN_NX2_PENDING_SPIN_US");
                         return v != nullptr ? std::atoll(v) : 500LL;
                     }()};
+                    // nup EDEN_NX2_PENDING_POLL_US: inside the spin window, wait this long with
+                    // PAUSE between polls instead of a yield per poll (0 = yield, as before).
+                    // ResumePending ran 200k-600k times a second at the market; the PAUSE wait
+                    // leaves the core's SMT sibling (often the back thread or a guest core) free.
+                    static const auto poll_gap = std::chrono::microseconds{[] {
+                        const char* v = std::getenv("EDEN_NX2_PENDING_POLL_US");
+                        return v != nullptr ? std::atoll(v) : 0LL;
+                    }()};
                     if (waited < spin_window) {
-                        std::this_thread::yield();
+                        if (poll_gap.count() > 0) {
+                            const auto until = std::chrono::steady_clock::now() + poll_gap;
+                            do {
+                                for (int i = 0; i < 16; ++i) {
+#if defined(_M_X64) || defined(__x86_64__)
+                                    _mm_pause();
+#endif
+                                }
+                            } while (std::chrono::steady_clock::now() < until);
+                        } else {
+                            std::this_thread::yield();
+                        }
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32
                         // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
