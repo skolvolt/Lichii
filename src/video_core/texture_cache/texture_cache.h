@@ -1348,6 +1348,15 @@ bool TextureCache<P>::RescaleRenderTargets() {
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
         check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
+        // A square depth target with no color target is a shadow map. Scaling it doesn't sharpen
+        // the picture, it multiplies the map's memory by the square of the scale (648 MiB for
+        // Ocarina of Time's 12288x12288 sun shadow map at 1.5x). A full-screen depth prepass isn't
+        // square, so it still scales.
+        if (can_rescale && tmp_depth_image != CORRUPT_ID &&
+            std::ranges::all_of(tmp_color_images, [](ImageId id) { return id == CORRUPT_ID; })) {
+            const Extent3D& size = slot_images[tmp_depth_image].info.size;
+            can_rescale = size.width != size.height;
+        }
 
         if (can_rescale) {
             rescaled = any_rescaled || scale_rating >= 2;
