@@ -592,11 +592,17 @@ json ReadGpuMemory(ToolState& state, const json& params) {
 /// last step; leaving this function by any path removes it.
 json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json& params,
               const ClientGone& client_gone) {
+    // by_time: each step's "frames" is milliseconds of real time instead of presented frames, so a
+    // path recorded at one frame rate replays the same at another (the game moves by real time).
+    const bool by_time = params.value("by_time", false);
     u64 total = 0;
     for (const InputStep& step : steps) {
         total += step.frames;
     }
-    if (total > MAX_INPUT_FRAMES) {
+    if (by_time && total > 600'000) {
+        throw std::runtime_error{"by_time: at most 600000 ms per call"};
+    }
+    if (!by_time && total > MAX_INPUT_FRAMES) {
         throw std::runtime_error{
             fmt::format("{} frames in total; at most {} per call", total, MAX_INPUT_FRAMES)};
     }
@@ -610,12 +616,25 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
     if (!controller->IsConnected()) {
         throw std::runtime_error{"neither player 1 nor the handheld controller is connected"};
     }
-    const int timeout = Param<int>(params, "timeout_s", static_cast<int>(total / 20 + 10), 1, 900);
+    const int timeout = Param<int>(params, "timeout_s",
+                                   static_cast<int>(by_time ? total / 1000 + 30 : total / 20 + 10),
+                                   1, 900);
     const u64 start = g_nx2_present_count.load(std::memory_order_relaxed) + 1;
     const auto script = std::make_shared<const std::vector<InputStep>>(steps);
-    controller->SetInputInjector([script, start] {
-        return InputAt(*script, start, g_nx2_present_count.load(std::memory_order_relaxed));
-    });
+    const auto time_start = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [time_start] {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - time_start)
+                                    .count());
+    };
+    if (by_time) {
+        controller->SetInputInjector(
+            [script, elapsed_ms] { return InputAt(*script, 0, elapsed_ms()); });
+    } else {
+        controller->SetInputInjector([script, start] {
+            return InputAt(*script, start, g_nx2_present_count.load(std::memory_order_relaxed));
+        });
+    }
     SCOPE_EXIT {
         controller->SetInputInjector({});
     };
@@ -623,7 +642,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
     const auto deadline = begin + std::chrono::seconds{timeout};
     for (;;) {
         const u64 now = g_nx2_present_count.load(std::memory_order_relaxed);
-        if (now >= start + total) {
+        if (by_time ? elapsed_ms() >= total : now >= start + total) {
             break;
         }
         if (state.stopping.load(std::memory_order_relaxed)) {
@@ -689,6 +708,8 @@ json RecordInput(ToolState& state, const json& params, const ClientGone& client_
         return static_cast<int>(std::lround(static_cast<double>(v) * 100.0 / HID::HID_JOYSTICK_MAX));
     };
     std::vector<std::pair<Frame, u64>> runs;
+    std::vector<double> run_ms; // real time each run was held
+    auto last_present_time = std::chrono::steady_clock::now();
     u64 last_present = g_nx2_present_count.load(std::memory_order_relaxed);
     u64 idle_frames = 0;
     bool started = !start_on_input;
@@ -706,6 +727,10 @@ json RecordInput(ToolState& state, const json& params, const ClientGone& client_
             continue;
         }
         last_present = present;
+        if (!run_ms.empty()) {
+            run_ms.back() += std::chrono::duration<double, std::milli>(now - last_present_time).count();
+        }
+        last_present_time = now;
         const auto sticks = controller->GetSticks();
         const Frame frame{static_cast<u64>(controller->GetNpadButtons().raw) & known_buttons,
                           axis(sticks.left.x), axis(sticks.left.y), axis(sticks.right.x),
@@ -721,6 +746,7 @@ json RecordInput(ToolState& state, const json& params, const ClientGone& client_
             ++runs.back().second;
         } else {
             runs.emplace_back(frame, 1);
+            run_ms.push_back(0.0);
         }
         idle_frames = frame.Neutral() ? idle_frames + 1 : 0;
         if (idle_stop > 0.0 && idle_frames >= static_cast<u64>(idle_stop * 60.0)) {
@@ -729,10 +755,14 @@ json RecordInput(ToolState& state, const json& params, const ClientGone& client_
     }
     if (!runs.empty() && runs.back().first.Neutral()) {
         runs.pop_back(); // the idle tail that ended the recording
+        run_ms.pop_back();
     }
     json steps = json::array();
+    json timed_steps = json::array();
     u64 total = 0;
-    for (const auto& [frame, count] : runs) {
+    double carry = 0.0; // rounding to whole ms without drifting
+    for (size_t index = 0; index < runs.size(); ++index) {
+        const auto& [frame, count] = runs[index];
         json step{{"frames", count}};
         json buttons = json::array();
         for (const auto& [name, bit] : INPUT_BUTTONS) {
@@ -747,8 +777,16 @@ json RecordInput(ToolState& state, const json& params, const ClientGone& client_
         step["right_stick"] = {frame.rx / 100.0, frame.ry / 100.0};
         steps.push_back(step);
         total += count;
+        carry += run_ms[index];
+        const double whole = std::floor(carry);
+        if (whole >= 1.0) {
+            json timed = step;
+            timed["frames"] = static_cast<u64>(whole);
+            timed_steps.push_back(timed);
+            carry -= whole;
+        }
     }
-    return {{"steps", steps}, {"frames", total}, {"started", started}};
+    return {{"steps", steps}, {"timed_steps", timed_steps}, {"frames", total}, {"started", started}};
 }
 
 json InputSequence(ToolState& state, const json& params, const ClientGone& client_gone) {
@@ -959,8 +997,8 @@ InputStep ParseInputStep(const json& step) {
     InputStep result{.input = {}, .frames = 0};
     const json& frames = step.at("frames");
     if (!frames.is_number_integer() || frames.get<s64>() < 1 ||
-        frames.get<u64>() > MAX_INPUT_FRAMES) {
-        throw std::runtime_error{fmt::format("frames must be 1 to {}", MAX_INPUT_FRAMES)};
+        frames.get<u64>() > 600'000) {
+        throw std::runtime_error{"frames must be 1 to 600000"};
     }
     result.frames = frames.get<u64>();
     for (const json& button : step.value("buttons", json::array())) {
