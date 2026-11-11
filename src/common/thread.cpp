@@ -467,9 +467,6 @@ struct WindowsCpuSets {
     bool hybrid = false;
 };
 
-/// nup: the performance processors the pinned GPU threads leave free (set once they are pinned).
-std::atomic<const std::vector<ULONG>*> g_performance_unreserved{nullptr};
-
 const WindowsCpuSets& CpuSets() {
     static const WindowsCpuSets sets = [] {
         WindowsCpuSets result;
@@ -728,10 +725,7 @@ void SetCurrentThreadToPerformanceCores() {
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
 #elif defined(_WIN32)
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
-        // nup: once the GPU threads own their cores, the rest of the performance cores.
-        const std::vector<ULONG>* unreserved =
-            g_performance_unreserved.load(std::memory_order_acquire);
-        SelectCurrentThreadCpuSets(unreserved != nullptr ? *unreserved : sets.performance);
+        SelectCurrentThreadCpuSets(sets.performance);
     }
 #endif
 }
@@ -741,15 +735,10 @@ void PinCurrentThread(PinnedRole role) {
     struct PinnedCpuSets {
         std::vector<ULONG> front;
         std::vector<ULONG> back;
-        std::vector<ULONG> worker;
         std::vector<ULONG> guest;
     };
     static const PinnedCpuSets pinned = [] {
-        // nup: EDEN_NX2_PIN_WORKER=0 leaves the Vulkan worker on any performance core and other
-        // threads anywhere, as before.
-        const char* const pin_worker = std::getenv("EDEN_NX2_PIN_WORKER");
-        const GpuThreadPinning plan = PlanGpuThreadPinning(
-            CpuSets().processors, pin_worker == nullptr || pin_worker[0] != '0');
+        const GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
         if (plan.front.empty()) {
             LOG_WARNING(Common,
                         "GPU thread pinning skipped: {} physical performance cores, needs {}",
@@ -760,50 +749,13 @@ void PinCurrentThread(PinnedRole role) {
                  "GPU thread pinning: front and back on a physical core each, guest cores on the "
                  "other {} performance cores ({} logical processors)",
                  plan.performance_cores - 2, plan.guest.size());
-        if (!plan.worker.empty()) {
-            // Every thread without a selection of its own (the driver's, the shader compilers',
-            // threads made later) and every one placed on the performance cores keeps off the
-            // front's, back's and worker's cores, so nothing shares them.
-            static std::vector<ULONG> others;
-            static std::vector<ULONG> unreserved;
-            const auto reserved = [&plan](u32 id) {
-                return std::ranges::find(plan.front, id) != plan.front.end() ||
-                       std::ranges::find(plan.back, id) != plan.back.end() ||
-                       std::ranges::find(plan.worker, id) != plan.worker.end();
-            };
-            for (const LogicalProcessor& processor : CpuSets().processors) {
-                if (!reserved(processor.id)) {
-                    others.push_back(processor.id);
-                }
-            }
-            for (const ULONG id : CpuSets().performance) {
-                if (!reserved(id)) {
-                    unreserved.push_back(id);
-                }
-            }
-            using PFN_SetProcessDefaultCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
-            const auto set_default = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
-                reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                       "SetProcessDefaultCpuSets")));
-            if (set_default != nullptr &&
-                !set_default(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size()))) {
-                LOG_WARNING(Common, "SetProcessDefaultCpuSets failed: {}", GetLastErrorMsg());
-            }
-            g_performance_unreserved.store(&unreserved, std::memory_order_release);
-            LOG_INFO(Common,
-                     "GPU thread pinning: the Vulkan worker on a physical core of its own; other "
-                     "threads on the remaining {} logical processors (EDEN_NX2_PIN_WORKER=0: off)",
-                     others.size());
-        }
         return PinnedCpuSets{{plan.front.begin(), plan.front.end()},
                              {plan.back.begin(), plan.back.end()},
-                             {plan.worker.begin(), plan.worker.end()},
                              {plan.guest.begin(), plan.guest.end()}};
     }();
-    const std::vector<ULONG>& ids = role == PinnedRole::GpuFront       ? pinned.front
-                                    : role == PinnedRole::GpuBack      ? pinned.back
-                                    : role == PinnedRole::VulkanWorker ? pinned.worker
-                                                                       : pinned.guest;
+    const std::vector<ULONG>& ids = role == PinnedRole::GpuFront  ? pinned.front
+                                    : role == PinnedRole::GpuBack ? pinned.back
+                                                                  : pinned.guest;
     if (!ids.empty()) {
         SelectCurrentThreadCpuSets(ids);
     }
@@ -822,10 +774,9 @@ void PinCurrentThread(PinnedRole role) {
         }
         return result;
     }();
-    const std::vector<u32>& cpus = role == PinnedRole::GpuFront       ? plan.front
-                                   : role == PinnedRole::GpuBack      ? plan.back
-                                   : role == PinnedRole::VulkanWorker ? plan.worker
-                                                                      : plan.guest;
+    const std::vector<u32>& cpus = role == PinnedRole::GpuFront  ? plan.front
+                                   : role == PinnedRole::GpuBack ? plan.back
+                                                                 : plan.guest;
     if (!cpus.empty()) {
         SetCurrentThreadAffinity(cpus);
     }

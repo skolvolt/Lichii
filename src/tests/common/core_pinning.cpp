@@ -122,22 +122,6 @@ TEST_CASE("Core pinning: hybrid 8 P-cores with SMT and 16 E-cores", "[common][co
     CheckCoresAreDedicated(processors, plan);
 }
 
-TEST_CASE("Core pinning: hybrid 8 P-cores, the Vulkan worker on a core of its own",
-          "[common][core_pinning]") {
-    std::vector<LogicalProcessor> processors;
-    AddCores(processors, 8, 2, 1);
-    AddCores(processors, 4, 1, 0);
-    const auto plan = Common::PlanGpuThreadPinning(processors, true);
-    CHECK(plan.front == Ids(2, 2));
-    CHECK(plan.back == Ids(4, 2));
-    CHECK(plan.worker == Ids(6, 2));
-    CHECK(plan.guest == Concat(Ids(0, 2), Ids(8, 8)));
-    // Six P-cores leave none for the worker.
-    std::vector<LogicalProcessor> six;
-    AddCores(six, 6, 2, 1);
-    CHECK(Common::PlanGpuThreadPinning(six, true).worker.empty());
-}
-
 TEST_CASE("Core pinning: E-cores enumerated first leave the P-cores to the pinned threads",
           "[common][core_pinning]") {
     std::vector<LogicalProcessor> processors;
