@@ -828,6 +828,8 @@ private:
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

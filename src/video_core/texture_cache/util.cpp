@@ -1545,6 +1545,15 @@ bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32
     }
 }
 
+bool IsPaddedSquare(const ImageInfo& info) noexcept {
+    if (info.type != ImageType::e2D || info.num_samples != 1 || info.size.width <= info.size.height) {
+        return false;
+    }
+    ImageInfo square = info;
+    square.size.width = info.size.height;
+    return IsBlockLinearSizeCompatible(info, square, 0, 0, false);
+}
+
 bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,
                                            u32 lhs_level, u32 rhs_level) noexcept {
     ASSERT(lhs.type != ImageType::Linear);

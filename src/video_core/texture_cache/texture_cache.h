@@ -1342,7 +1342,8 @@ bool TextureCache<P>::RescaleRenderTargets() {
             }
             check_rescale(color_buffer_id, tmp_color_images[index]);
         }
-        if (flags[Dirty::ZetaBuffer] || force) {
+        // The surface clip, which a padded depth target's size depends on, has no flag of its own.
+        if (flags[Dirty::ZetaBuffer] || force || depth_target_padded) {
             flags[Dirty::ZetaBuffer] = false;
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
@@ -4197,6 +4198,7 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
 template <class P>
 ImageViewId TextureCache<P>::FindDepthBuffer() {
     const auto& regs = maxwell3d->regs;
+    depth_target_padded = false;
     if (!regs.zeta_enable) {
         return ImageViewId{};
     }
@@ -4204,7 +4206,19 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    depth_target_padded = IsPaddedSquare(info);
+    // Ocarina of Time draws its shadow maps into depth targets padded to whole GOBs (800x793) and
+    // samples them as the square texture they are (793x793). The padding is not part of the
+    // image: the surface clip bounds rendering, so a clip inside the square never reaches it.
+    // One image then serves both, instead of two with a copy for each new size.
+    const u32 clip_right = regs.surface_clip.x.Value() + regs.surface_clip.width.Value();
+    if (depth_target_padded && clip_right <= info.size.height) {
+        info.size.width = info.size.height;
+        // nup: the render target lookup memo is keyed without the surface clip, which
+        // decides this: a padded square skips the memo.
+        return FindRenderTargetView(info, gpu_addr);
+    }
     static_assert(sizeof(regs.zeta) == 5 * sizeof(u32) && sizeof(regs.zeta_size) == 3 * sizeof(u32));
     RenderTargetLookupKey key{};
     key[0] = 0x100;
