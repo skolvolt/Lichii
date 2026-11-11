@@ -582,6 +582,11 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// nup (after Fritchii's EXP58): deletes, without a download, GPU-written images untouched for
+    /// a while whose memory a newer image of another shape has used since (see the definition).
+    void SweepSuperseded();
+    u64 swept_superseded{}; ///< Since the last report
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 

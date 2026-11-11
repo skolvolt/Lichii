@@ -143,6 +143,67 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
+void TextureCache<P>::SweepSuperseded() {
+    // A render target the GPU wrote, untouched for SupersededFrames, whose memory a newer image
+    // of another shape (used since) also covers: the game reused that memory for another layout,
+    // so nothing reads the old contents. Such images were kept until the collector reached them
+    // near the memory budget, then downloaded first (a full GPU wait each) or made room by
+    // evicting live textures. Fritchii's EXP58 (Castle Town: device memory 7.8-10.5 -> 5.2-5.7
+    // GB, worst frames 140-180 -> 30-48 ms). EDEN_NX2_SWEEP_SUPERSEDED=0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SWEEP_SUPERSEDED");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr u64 SupersededFrames = 60;
+    if (!enabled || frame_tick < SupersededFrames || frame_tick % 30 != 0) {
+        return;
+    }
+    std::vector<ImageId> dead;
+    lru_cache.ForEachItemBelow(frame_tick - SupersededFrames, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            False(image.flags & ImageFlagBits::Registered) ||
+            True(image.flags & ImageFlagBits::IsDecoding)) {
+            return false;
+        }
+        const u64 used = lru_cache.Tick(image.lru_index);
+        bool superseded = false;
+        ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
+                             [&](ImageId other_id, Image& other) {
+                                 if (other_id == image_id || other.lru_index == SIZE_MAX ||
+                                     False(other.flags & ImageFlagBits::Registered) ||
+                                     lru_cache.Tick(other.lru_index) <= used ||
+                                     (other.info.size == image.info.size &&
+                                      other.info.format == image.info.format &&
+                                      other.info.type == image.info.type)) {
+                                     return false;
+                                 }
+                                 superseded = true;
+                                 return true;
+                             });
+        if (superseded) {
+            dead.push_back(image_id);
+        }
+        return false;
+    });
+    for (const ImageId image_id : dead) {
+        Image& image = slot_images[image_id];
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+    }
+    swept_superseded += dead.size();
+    if (frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU, "Superseded sweep, last 600 frames: {} images deleted without a download",
+                 swept_superseded);
+        swept_superseded = 0;
+    }
+}
+
+template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
@@ -588,6 +649,7 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
+    SweepSuperseded();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
