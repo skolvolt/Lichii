@@ -115,11 +115,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     }()};
                     // nup EDEN_NX2_PENDING_POLL_US: inside the spin window, wait this long with
                     // PAUSE between polls instead of a yield per poll (0 = yield, as before).
+                    // 2 us measured best at the market: route 58.6 -> 60.9 fps (1, 5, 10, 20 us less).
                     // ResumePending ran 200k-600k times a second at the market; the PAUSE wait
                     // leaves the core's SMT sibling (often the back thread or a guest core) free.
                     static const auto poll_gap = std::chrono::microseconds{[] {
                         const char* v = std::getenv("EDEN_NX2_PENDING_POLL_US");
-                        return v != nullptr ? std::atoll(v) : 0LL;
+                        return v != nullptr ? std::atoll(v) : 2LL;
                     }()};
                     if (waited < spin_window) {
                         if (poll_gap.count() > 0) {
