@@ -759,7 +759,7 @@ void PinCurrentThread(PinnedRole role) {
         LOG_INFO(Common,
                  "GPU thread pinning: front and back on a physical core each, guest cores on the "
                  "other {} performance cores ({} logical processors)",
-                 plan.performance_cores - 2 - (plan.worker.empty() ? 0 : 1), plan.guest.size());
+                 plan.performance_cores - 2, plan.guest.size());
         if (!plan.worker.empty()) {
             // Every thread without a selection of its own (the driver's, the shader compilers',
             // threads made later) and every one placed on the performance cores keeps off the
