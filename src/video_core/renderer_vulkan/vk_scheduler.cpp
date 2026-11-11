@@ -598,7 +598,9 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
-    if (!Settings::values.pin_gpu_threads.GetValue()) {
+    if (Settings::values.pin_gpu_threads.GetValue()) {
+        Common::PinCurrentThread(Common::PinnedRole::VulkanWorker);
+    } else {
         Common::PinHostThread(Common::HostThreadRole::VulkanWorker);
     }
 

@@ -31,13 +31,17 @@ struct GpuThreadPinning {
     std::size_t performance_cores{};
     std::vector<u32> front;
     std::vector<u32> back;
+    /// nup: the Vulkan worker's core, when PlanGpuThreadPinning was asked for one (else empty).
+    std::vector<u32> worker;
     std::vector<u32> guest;
 };
 
 /// The split GPU thread's front and back each get a whole physical performance core, so no SMT
 /// sibling shares it, and the guest cores get the remaining performance cores. Core 0 takes most
 /// interrupts, so the GPU threads get the next two.
-[[nodiscard]] GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processors);
+/// `worker_core`: with 8 or more performance cores, the Vulkan worker gets the next one too.
+[[nodiscard]] GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processors,
+                                                    bool worker_core = false);
 
 /// The CPUs of a Linux sysfs CPU list such as "0-3,8,10-11", in order. Empty for an empty or
 /// malformed list.
