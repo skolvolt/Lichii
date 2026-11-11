@@ -45,7 +45,7 @@ constexpr size_t RING_LINES = 20000;
 constexpr u64 MAX_READ = 64 * 1024;
 /// Presented frames one input or input_sequence call holds at most (10 minutes at 60 fps).
 constexpr u64 MAX_INPUT_FRAMES = 36000;
-constexpr size_t MAX_INPUT_STEPS = 1000;
+constexpr size_t MAX_INPUT_STEPS = 40000; // a recorded path changes its sticks most frames
 
 constexpr std::array<std::pair<std::string_view, HID::NpadButton>, 16> INPUT_BUTTONS{{
     {"A", HID::NpadButton::A},         {"B", HID::NpadButton::B},
@@ -656,6 +656,101 @@ json Input(ToolState& state, const json& params, const ClientGone& client_gone) 
     return RunInput(state, {ParseInputStep(step)}, params, client_gone);
 }
 
+/// record_input: what player 1 (or handheld) sends the game, once per presented frame, as
+/// input_sequence steps, so a path someone plays can be replayed. Starts at the first non-neutral
+/// input (start_on_input, default on) and ends after idle_stop_s of neutral input (default 3) or
+/// after seconds (default 120). Sticks are rounded to 1/100; equal frames are merged.
+json RecordInput(ToolState& state, const json& params, const ClientGone& client_gone) {
+    const double seconds = Param<double>(params, "seconds", 120.0, 1.0, 600.0);
+    const double idle_stop = Param<double>(params, "idle_stop_s", 3.0, 0.0, 60.0);
+    const bool start_on_input = params.value("start_on_input", true);
+    auto& hid = state.system.HIDCore();
+    HID::EmulatedController* controller = hid.GetEmulatedController(HID::NpadIdType::Player1);
+    if (!controller->IsConnected()) {
+        controller = hid.GetEmulatedController(HID::NpadIdType::Handheld);
+    }
+    if (!controller->IsConnected()) {
+        throw std::runtime_error{"neither player 1 nor the handheld controller is connected"};
+    }
+    struct Frame {
+        u64 buttons;
+        int lx, ly, rx, ry;
+        bool operator==(const Frame&) const = default;
+        bool Neutral() const {
+            return buttons == 0 && std::abs(lx) < 10 && std::abs(ly) < 10 && std::abs(rx) < 10 &&
+                   std::abs(ry) < 10;
+        }
+    };
+    u64 known_buttons = 0;
+    for (const auto& [_, bit] : INPUT_BUTTONS) {
+        known_buttons |= static_cast<u64>(bit);
+    }
+    const auto axis = [](s32 v) {
+        return static_cast<int>(std::lround(static_cast<double>(v) * 100.0 / HID::HID_JOYSTICK_MAX));
+    };
+    std::vector<std::pair<Frame, u64>> runs;
+    u64 last_present = g_nx2_present_count.load(std::memory_order_relaxed);
+    u64 idle_frames = 0;
+    bool started = !start_on_input;
+    const auto begin = std::chrono::steady_clock::now();
+    auto record_start = begin;
+    while (!state.stopping.load(std::memory_order_relaxed) && !client_gone()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - (started ? record_start : begin)).count() >
+            seconds) {
+            break;
+        }
+        const u64 present = g_nx2_present_count.load(std::memory_order_relaxed);
+        if (present == last_present) {
+            std::this_thread::sleep_for(1ms);
+            continue;
+        }
+        last_present = present;
+        const auto sticks = controller->GetSticks();
+        const Frame frame{static_cast<u64>(controller->GetNpadButtons().raw) & known_buttons,
+                          axis(sticks.left.x), axis(sticks.left.y), axis(sticks.right.x),
+                          axis(sticks.right.y)};
+        if (!started) {
+            if (frame.Neutral()) {
+                continue;
+            }
+            started = true;
+            record_start = now;
+        }
+        if (!runs.empty() && runs.back().first == frame) {
+            ++runs.back().second;
+        } else {
+            runs.emplace_back(frame, 1);
+        }
+        idle_frames = frame.Neutral() ? idle_frames + 1 : 0;
+        if (idle_stop > 0.0 && idle_frames >= static_cast<u64>(idle_stop * 60.0)) {
+            break;
+        }
+    }
+    if (!runs.empty() && runs.back().first.Neutral()) {
+        runs.pop_back(); // the idle tail that ended the recording
+    }
+    json steps = json::array();
+    u64 total = 0;
+    for (const auto& [frame, count] : runs) {
+        json step{{"frames", count}};
+        json buttons = json::array();
+        for (const auto& [name, bit] : INPUT_BUTTONS) {
+            if (frame.buttons & static_cast<u64>(bit)) {
+                buttons.push_back(std::string{name});
+            }
+        }
+        if (!buttons.empty()) {
+            step["buttons"] = buttons;
+        }
+        step["left_stick"] = {frame.lx / 100.0, frame.ly / 100.0};
+        step["right_stick"] = {frame.rx / 100.0, frame.ry / 100.0};
+        steps.push_back(step);
+        total += count;
+    }
+    return {{"steps", steps}, {"frames", total}, {"started", started}};
+}
+
 json InputSequence(ToolState& state, const json& params, const ClientGone& client_gone) {
     const json& list = params.at("steps");
     if (!list.is_array() || list.empty() || list.size() > MAX_INPUT_STEPS) {
@@ -696,6 +791,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"read_gpu_memory", handler(ReadGpuMemory)},
         {"input", waiting(Input)},
         {"input_sequence", waiting(InputSequence)},
+        {"record_input", waiting(RecordInput)},
     };
 }
 
