@@ -63,6 +63,14 @@ inline const bool g_uniform_range_reuse = [] {
     return value == nullptr || value[0] != '0';
 }();
 
+/// nup EDEN_NX2_UBO_STREAK (default 8, 0 off): a slot whose last this-many binds all missed
+/// (its bytes change every bind: per-draw matrices) copies straight into the stream buffer for its
+/// next 64 binds, skipping the compares and the extra copy into the reuse store, then tries again.
+inline const u32 g_uniform_miss_streak = [] {
+    const char* const value = std::getenv("EDEN_NX2_UBO_STREAK");
+    return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8U;
+}();
+
 /// What BindSmallUniformReusing did.
 enum class UniformReuseResult : u8 {
     None,     ///< nothing bound (the caller binds the buffer itself)
@@ -99,6 +107,8 @@ public:
     struct Slot {
         u32 copy{};
         u32 serial{}; ///< the copy's serial then; 0: none
+        u16 misses{}; ///< binds in a row that found no reusable copy (EDEN_NX2_UBO_STREAK)
+        u16 direct{}; ///< binds left that copy straight to the stream buffer
     };
 
     UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
@@ -174,6 +184,18 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
+    if (slot.direct != 0) {
+        // A slot whose bytes change every bind: one copy, no compares. Its old copy is dropped
+        // (serial 0), so the next reuse attempt starts clean.
+        --slot.direct;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        slot.serial = 0;
+        if (result != nullptr) {
+            *result = UniformReuseResult::Copied;
+        }
+        return true;
+    }
     // The bytes are compared where they are when contiguous (one copy fewer than through the
     // scratch buffer), and copied once into the copy's bytes when they differ: the stream
     // allocation is filled from those bytes, never from guest memory.
@@ -197,7 +219,7 @@ template <class Runtime, class DeviceMemory>
     const auto rebind = [&](size_t copy_index, UniformReuseResult kind) {
         const typename Reuse::Copy& copy = reuse.copies[copy_index];
         runtime.RebindStreamUniform(copy.ref, size);
-        slot = typename Reuse::Slot{static_cast<u32>(copy_index), copy.serial};
+        slot = typename Reuse::Slot{static_cast<u32>(copy_index), copy.serial, 0, 0};
         if (result != nullptr) {
             *result = kind;
         }
@@ -264,7 +286,12 @@ template <class Runtime, class DeviceMemory>
     copy.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     copy.tick = runtime.CurrentTick();
-    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};
+    const u16 misses = slot_same ? u16{0} : static_cast<u16>(slot.misses + 1);
+    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial, misses, 0};
+    if (g_uniform_miss_streak != 0 && misses >= g_uniform_miss_streak) {
+        slot.misses = 0;
+        slot.direct = 64;
+    }
     if (result != nullptr) {
         *result = slot_same ? UniformReuseResult::Recopied : UniformReuseResult::Copied;
     }
