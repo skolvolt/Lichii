@@ -413,3 +413,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(dynarmic PRIVATE FMT_USE_WINDOWS_H=0)
 endif()
 target_compile_definitions(dynarmic PRIVATE FMT_USE_USER_DEFINED_LITERALS=1)
+
+# nup: NUP_LTO_NO_DYNARMIC=ON keeps the JIT out of a program-wide ThinLTO (whole-program ThinLTO broke
+# the guest ~7 s after boot on 11 Nov).
+option(NUP_LTO_NO_DYNARMIC "Build dynarmic without LTO" OFF)
+if (NUP_LTO_NO_DYNARMIC)
+    target_compile_options(dynarmic PRIVATE -fno-lto)
+endif()
