@@ -285,7 +285,14 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         spin_us = 0;
 #else
         const KProcess* process = kernel.ApplicationProcess();
-        spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
+        // nup: not for Ocarina of Time. Its six guest cores idling in this PAUSE loop share
+        // physical cores (SMT) with the GPU threads: fountain lap 52.2 fps with 100 us, 57.7 with
+        // 25, 60.1 with 0 (orbit 52.3 -> 59.1, standing 52.6 -> 58.3); 5 and 10 us were level with 0.
+        constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
+        spin_us = process != nullptr && process->IsSwitch2() &&
+                          process->GetProgramId() != ocarina_of_time
+                      ? 100
+                      : 0;
 #endif
     }
     const auto spin = std::chrono::microseconds{spin_us};
