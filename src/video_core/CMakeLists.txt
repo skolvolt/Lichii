@@ -599,3 +599,9 @@ add_custom_target(native_preparation_revision
     VERBATIM)
 add_dependencies(video_core native_preparation_revision)
 target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+# nup: ThinLTO for video_core only (NUP_LTO_VIDEO_CORE=ON). Whole-program ThinLTO broke the guest
+# ~7 s after boot (11 Nov, not bisected); the GPU back thread's code is all in here.
+option(NUP_LTO_VIDEO_CORE "ThinLTO for video_core only" OFF)
+if (NUP_LTO_VIDEO_CORE)
+    target_compile_options(video_core PRIVATE -flto=thin)
+endif()
