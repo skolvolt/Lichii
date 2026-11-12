@@ -739,13 +739,11 @@ struct Values {
                                                         Specialization::Default,
                                                         true,
                                                         true};
-    SwitchableSetting<bool> async_presentation{linkage,
-#ifdef __ANDROID__
-                                               true,
-#else
-                                               false,
-#endif
-                                               "async_presentation", Category::RendererHacks};
+    // nup: on everywhere. Presenting on its own thread takes the swapchain copy, vkQueuePresent
+    // and any overlay hooks off the GPU back thread (OoT fountain lap at 1X: 45.6 -> 46.3 fps,
+    // fewer hitches; it was already the Android default).
+    SwitchableSetting<bool> async_presentation{linkage, true, "async_presentation",
+                                               Category::RendererHacks};
 
     SwitchableSetting<bool> fix_bloom_effects{linkage, false, "fix_bloom_effects",
                                                      Category::RendererHacks};
