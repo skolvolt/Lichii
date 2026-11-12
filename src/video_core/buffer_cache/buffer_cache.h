@@ -171,7 +171,8 @@ void BufferCache<P>::TickFrame() {
     AdvanceUniformCacheHistory(channel_state->uniform_cache_shots);
 
     const bool skip_preferred = hits * 256 < shots * 251;
-    channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
+    channel_state->uniform_buffer_skip_cache_size =
+        skip_preferred ? VideoCommon::g_uniform_stream_max : 0; // DEFAULT_SKIP_CACHE_SIZE by default
 
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {

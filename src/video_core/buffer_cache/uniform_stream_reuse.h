@@ -71,6 +71,15 @@ inline const u32 g_uniform_miss_streak = [] {
     return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8U;
 }();
 
+/// nup EDEN_NX2_UBO_STREAM_MAX (bytes, default 4096, at most 16384): uniform buffers up to this size
+/// are streamed (and reused) instead of going through the cached buffers. Ocarina's skinned models
+/// bind 7-13 KiB bone palettes ~8 times a frame each with the same bytes within the frame.
+inline const u32 g_uniform_stream_max = [] {
+    const char* const value = std::getenv("EDEN_NX2_UBO_STREAM_MAX");
+    const u32 bytes = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 4096U;
+    return bytes < 256U ? 256U : (bytes > 16384U ? 16384U : bytes);
+}();
+
 /// What BindSmallUniformReusing did.
 enum class UniformReuseResult : u8 {
     None,     ///< nothing bound (the caller binds the buffer itself)
@@ -83,7 +92,7 @@ enum class UniformReuseResult : u8 {
 template <class Ref>
 class UniformStreamReuse {
 public:
-    static constexpr u32 MaxBytes = 4096; // BufferCache's DEFAULT_SKIP_CACHE_SIZE
+    static constexpr u32 MaxBytes = 16384; // the most EDEN_NX2_UBO_STREAM_MAX allows
     static constexpr size_t NumStages = 6; // the five graphics stages and compute
     static constexpr size_t NumSlots = 18; // Maxwell constant buffers per stage
     /// One private copy per slot (all EDEN_NX2_UBO_RANGE_REUSE=0 uses), then the range-keyed
