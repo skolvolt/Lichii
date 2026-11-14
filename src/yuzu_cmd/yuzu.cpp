@@ -72,6 +72,7 @@
 // windows.h needs to be included before shellapi.h
 #include <windows.h>
 #include <shellapi.h>
+#include "common/windows/crash_handler.h"
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -81,75 +82,6 @@ extern "C" {
 // graphics
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
-}
-
-// EDEN_NX2_CRASH_DUMP=<dir>: on an unhandled exception (a real crash; fastmem faults are handled
-// before this), write <dir>/eden-crash-<pid>.dmp. A debugger changes the timing enough to hide
-// some crashes, so this catches them at full speed. dbghelp.dll is loaded only then.
-// Prints a code address as module+offset (resolve with llvm-symbolizer and the module's PDB).
-static void PrintCodeAddress(const char* label, const void* address) {
-    HMODULE module{};
-    char name[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCSTR>(address), &module)) {
-        GetModuleFileNameA(module, name, sizeof(name));
-    }
-    const char* base_name = std::strrchr(name, '\\');
-    std::fprintf(stderr, "  %s %p %s+%#llx\n", label, address, base_name ? base_name + 1 : name,
-                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) -
-                                                 reinterpret_cast<uintptr_t>(module)));
-}
-
-static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
-    static std::atomic<bool> written{};
-    const char* directory = std::getenv("EDEN_NX2_CRASH_DUMP");
-    if (directory == nullptr || written.exchange(true)) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    // The faulting address and stack first: they survive even if the dump fails.
-    const EXCEPTION_RECORD& record = *exception->ExceptionRecord;
-    std::fprintf(stderr, "Unhandled exception %#lx on thread %lu, info %#llx %#llx\n",
-                 record.ExceptionCode, GetCurrentThreadId(),
-                 static_cast<unsigned long long>(record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0),
-                 static_cast<unsigned long long>(record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0));
-    PrintCodeAddress("at", record.ExceptionAddress);
-    void* frames[48];
-    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        PrintCodeAddress("frame", frames[i]);
-    }
-    std::fflush(stderr);
-    struct ExceptionInformation {
-        DWORD thread_id;
-        EXCEPTION_POINTERS* exception_pointers;
-        BOOL client_pointers;
-    };
-    using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, const ExceptionInformation*,
-                                              const void*, const void*);
-    const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-    const auto write = dbghelp ? reinterpret_cast<MiniDumpWriteDumpFn>(
-                                     GetProcAddress(dbghelp, "MiniDumpWriteDump"))
-                               : nullptr;
-    if (write == nullptr) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    char path[MAX_PATH];
-    std::snprintf(path, sizeof(path), "%s\\eden-crash-%lu.dmp", directory, GetCurrentProcessId());
-    const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        const ExceptionInformation information{GetCurrentThreadId(), exception, FALSE};
-        // MiniDumpWithThreadInfo; the larger MiniDumpWithIndirectlyReferencedMemory failed on
-        // Eden's address space and left an empty file.
-        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, 0x1000,
-                              &information, nullptr, nullptr);
-        const DWORD error = ok ? 0 : GetLastError();
-        CloseHandle(file);
-        std::fprintf(stderr, ok ? "Crash dump written to %s\n" : "Crash dump to %s failed (%#lx)\n",
-                     path, error);
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 
@@ -546,9 +478,6 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
 }
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
-#ifdef _WIN32
-    SetUnhandledExceptionFilter(WriteCrashDump);
-#endif
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
@@ -574,6 +503,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+#ifdef _WIN32
+    // EDEN_NX2_CRASH_DUMP=<dir> puts the dump somewhere other than the log directory.
+    const char* const crash_dump_dir = std::getenv("EDEN_NX2_CRASH_DUMP");
+    Common::Windows::InstallCrashHandler(
+        crash_dump_dir ? std::filesystem::path{crash_dump_dir}
+                       : Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#endif
 
     if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
         return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;

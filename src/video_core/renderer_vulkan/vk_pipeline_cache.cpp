@@ -1624,7 +1624,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     PreparePrecompiled(base_dir, precache, stop_loading, callback);
 
-    if (use_vulkan_pipeline_cache) {
+    // Skip the intermediate save where reading the driver cache during a build crashes (see
+    // Device::CanReadPipelineCacheDuringBuilds): without a precache the background prebuild can
+    // already be building into the cache here, and nothing joins its builds before this read; a
+    // stopped load can leave a cancelled prebuild build running past the same point. The
+    // session-end save in ~PipelineCache stays ordered after the build workers shut down and
+    // still covers persistence.
+    if (use_vulkan_pipeline_cache && device.CanReadPipelineCacheDuringBuilds()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
         size_t size = 0;

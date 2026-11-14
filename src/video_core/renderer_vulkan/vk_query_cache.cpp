@@ -60,15 +60,11 @@ public:
     ~SamplesQueryBank() = default;
 
     void Reset() override {
-        ASSERT(references == 0);
+        ASSERT(References() == 0);
         VideoCommon::BankBase::Reset();
         if (device.IsHostQueryResetSupported()) {
-            // On the Vulkan worker, ahead of the BeginQuery commands recorded after it: a host
-            // reset costs the recording thread ~100 us a bank on AMD's driver. The bank is dead
-            // (no query uses it and the GPU is done with it), so nothing else touches the pool.
-            scheduler.Record([dev = &device.GetLogical(), pool = *query_pool](vk::CommandBuffer) {
-                dev->ResetQueryPool(pool, 0, BANK_SIZE);
-            });
+            const auto& dev = device.GetLogical();
+            dev.ResetQueryPool(*query_pool, 0, BANK_SIZE);
         } else {
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([pool = *query_pool](vk::CommandBuffer cmdbuf) {
@@ -123,8 +119,10 @@ private:
     Scheduler& scheduler;
     const size_t index;
     vk::QueryPool query_pool;
-    std::array<u64, BANK_SIZE> host_results;
-    u64 last_used_tick{};
+    /// The fencing thread writes the results (Sync): on lines of their own, away from the
+    /// members the GPU thread reads at every report.
+    alignas(64) std::array<u64, BANK_SIZE> host_results;
+    alignas(64) u64 last_used_tick{};
 };
 
 using BaseStreamer = VideoCommon::SimpleStreamer<VideoCommon::HostQueryBase>;
@@ -573,6 +571,17 @@ private:
         ReleaseQuery(query_id);
     }
 
+    void FreeMany(std::span<const size_t> query_ids) override {
+        std::scoped_lock lk(guard);
+        for (const size_t query_id : query_ids) {
+            auto* query = GetQuery(query_id);
+            ApplyBankOp(query, [](SamplesQueryBank* bank, size_t start, size_t amount) {
+                bank->CloseReference(amount);
+            });
+            ReleaseQuery(query_id);
+        }
+    }
+
     void AbandonCurrentQuery() {
         if (!current_query) {
             return;
@@ -704,7 +713,7 @@ public:
     ~TFBQueryBank() = default;
 
     void Reset() override {
-        ASSERT(references == 0);
+        ASSERT(References() == 0);
         VideoCommon::BankBase::Reset();
     }
 

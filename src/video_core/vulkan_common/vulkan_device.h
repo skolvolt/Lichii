@@ -380,6 +380,12 @@ public:
                id != VK_DRIVER_ID_MESA_RADV;
     }
 
+    /// False where reading the driver pipeline cache while pipelines build into it crashes
+    /// (Intel's Windows driver; upstream Lichii #1462/#1685).
+    bool CanReadPipelineCacheDuringBuilds() const {
+        return GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+    }
+
     /// Returns true for tile-based deferred renderers.
     bool IsTiler() const {
         switch (GetDriverID()) {
