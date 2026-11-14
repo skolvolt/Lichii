@@ -8,6 +8,7 @@
 #include <cctype>
 #include <iostream>
 #include <sstream>
+#include <string>
 #include "common/container/unordered_map.h"
 
 #include "common/assert.h"
@@ -29,6 +30,7 @@
 #endif
 
 #ifdef __APPLE__
+#include <mach-o/dyld.h> // Used in GetExeDirectory()
 #include <sys/param.h> // Used in GetBundleDirectory()
 
 // CFURL contains __attribute__ directives that gcc does not know how to parse, so we need to just
@@ -382,6 +384,34 @@ fs::path GetDataDirectory(const std::string& env_name) {
     }
 
     return {};
+}
+
+#endif
+
+#ifndef _WIN32
+
+fs::path GetExeDirectory() {
+    std::error_code ec;
+#if defined(__APPLE__)
+    // The first call reports the size the path needs.
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buffer(size, '\0');
+    if (size != 0 && _NSGetExecutablePath(buffer.data(), &size) == 0) {
+        buffer.resize(std::char_traits<char>::length(buffer.c_str()));
+        const fs::path exe = fs::canonical(fs::path{buffer}, ec);
+        return ec ? fs::path{buffer}.parent_path() : exe.parent_path();
+    }
+#elif defined(__linux__)
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        return exe.parent_path();
+    }
+#endif
+    LOG_ERROR(Common_Filesystem,
+              "Failed to get the path to the executable of the current process; using the "
+              "current directory");
+    return fs::current_path(ec);
 }
 
 #endif
