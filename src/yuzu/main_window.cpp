@@ -4460,6 +4460,78 @@ void MainWindow::StartShaderWarm(u64 program_id, const std::string& game_path,
     shader_warm_dialog->Start();
 }
 
+/// Ocarina of Time's full shader set (120,000+ pipelines) is only precached from a recipe file,
+/// which is not part of the release: without one the precache covers the compute programs and
+/// the pipelines earlier sessions saved, and the rest still builds on first use. While the game
+/// has neither a recipe nor shaders prepared from one, ask for the file at every launch and copy
+/// it to where FindNativeRecipe looks. The launch goes on either way.
+void MainWindow::AskForNativeRecipe(u64 title_id) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
+    std::error_code ec;
+    if (title_id != ocarina_of_time ||
+        std::filesystem::exists(ShaderWarm::NativePreparationPath(title_id), ec)) {
+        return;
+    }
+    while (ShaderWarm::FindNativeRecipe(title_id).empty()) {
+        QMessageBox box(QMessageBox::Warning, tr("Shader Recipe Needed"),
+                        tr("The full shader precache of this game (over 120,000 shaders) is built "
+                           "from a recipe file, and none was found. Without it only part of the "
+                           "shaders are precached and the game stutters while it builds the "
+                           "rest.\n\n"
+                           "The recipe is the .nx2recipe file in the \"recipes\" folder of a "
+                           "Fritchii v5 release. Download a release, unzip it, and choose that "
+                           "file here. This is asked at every launch until a recipe is there."),
+                        QMessageBox::NoButton, this);
+        QPushButton* const choose = box.addButton(tr("Choose recipe file..."),
+                                                  QMessageBox::AcceptRole);
+        QPushButton* const page = box.addButton(tr("Open download page"),
+                                                QMessageBox::ActionRole);
+        box.addButton(tr("Start without"), QMessageBox::RejectRole);
+        box.setDefaultButton(choose);
+        box.exec();
+        if (box.clickedButton() == page) {
+            QDesktopServices::openUrl(
+                QUrl(QStringLiteral("https://github.com/Frizti/Fritchii/releases")));
+            continue;
+        }
+        if (box.clickedButton() != choose) {
+            LOG_INFO(Frontend, "Shader recipe: started without one");
+            return;
+        }
+        const QString file = QFileDialog::getOpenFileName(
+            this, tr("Select Precompile Recipe"), {},
+            tr("Lichii precompile recipes (*.nx2recipe);;All files (*)"));
+        if (file.isEmpty()) {
+            continue;
+        }
+        // Beside the application first (where a shipped recipe sits); a folder that cannot be
+        // written (Program Files) falls back to the title's shader folder.
+        const std::filesystem::path source{file.toStdU16String()};
+        const auto recipes = Common::FS::GetExeDirectory() / "recipes";
+        std::filesystem::create_directories(recipes, ec);
+        auto target = recipes / source.filename();
+        std::filesystem::copy_file(source, target,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            target = ShaderWarm::NativeRecipePath(title_id);
+            std::filesystem::create_directories(target.parent_path(), ec);
+            std::filesystem::copy_file(source, target,
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+        }
+        // The kept copy is taken as it is, so only a recipes\ copy can be checked here: one for
+        // another game or cache version is not found, and is removed again.
+        if (ec || ShaderWarm::FindNativeRecipe(title_id).empty()) {
+            std::filesystem::remove(target, ec);
+            QMessageBox::warning(this, tr("Shader Recipe Needed"),
+                                 tr("That file is not a recipe for this game and this version of "
+                                    "the emulator, or it could not be copied."));
+            continue;
+        }
+        LOG_INFO(Frontend, "Shader recipe: copied to {}", Common::FS::PathToUTF8String(target));
+    }
+}
+
 /// With precache_shaders on: a title precached before is precached again only when the driver or
 /// its precache file changed (the renderer checks). For one never precached, Ask asks whether to
 /// precache before the game starts, and a title without a precache file gets one built from its
@@ -4473,6 +4545,7 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         !Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
+    AskForNativeRecipe(title_id);
     if (!ShaderWarm::WarmPending(title_id)) {
         // Precached before: the renderer runs it again only when the driver or the file changed.
         ShaderWarm::RequestWarmBeforeStart(true);

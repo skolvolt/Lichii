@@ -368,6 +368,7 @@ private slots:
                          const std::filesystem::path& recipe);
     void OnGameListDeleteShaderWarm(u64 program_id);
     void PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path);
+    void AskForNativeRecipe(u64 title_id);
     void OnGameListExtractNup(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);

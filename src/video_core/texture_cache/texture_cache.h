@@ -149,14 +149,20 @@ void TextureCache<P>::SweepSuperseded() {
     // so nothing reads the old contents. Such images were kept until the collector reached them
     // near the memory budget, then downloaded first (a full GPU wait each) or made room by
     // evicting live textures. Fritchii's EXP58 (Castle Town: device memory 7.8-10.5 -> 5.2-5.7
-    // GB, worst frames 140-180 -> 30-48 ms). Off by default (Castle Town 4+4 runs: +3% within noise,
+    // GB, worst frames 140-180 -> 30-48 ms). Was off by default (Castle Town 4+4 runs: +3% within noise,
     // peak VRAM unchanged); EDEN_NX2_SWEEP_SUPERSEDED=1 turns it on.
-    static const bool enabled = [] {
+    // =1: images untouched for 60 frames, checked every 30. =<N> (2 or more): untouched for N
+    // frames, checked every min(N, 30) frames (Castle Town guard house at 3440x1440: the game
+    // moves ~20 targets a frame while the camera turns; 60 frames of them overflowed VRAM).
+    static const u64 SupersededFrames = [] {
         const char* value = std::getenv("EDEN_NX2_SWEEP_SUPERSEDED");
-        return value != nullptr && value[0] == '1';
+        // Skitchii 1.5: 3 by default (guard house orbit 16-24 -> 47-51 fps at 3440x1440; 2 lost
+        // fps standing, a bigger image pool lost more). =0 turns it off.
+        const u64 n = value != nullptr ? std::strtoull(value, nullptr, 10) : 3;
+        return n == 1 ? u64{60} : n;
     }();
-    constexpr u64 SupersededFrames = 60;
-    if (!enabled || frame_tick < SupersededFrames || frame_tick % 30 != 0) {
+    if (SupersededFrames == 0 || frame_tick < SupersededFrames ||
+        frame_tick % (std::min)(SupersededFrames, u64{30}) != 0) {
         return;
     }
     std::vector<ImageId> dead;
@@ -616,6 +622,11 @@ void TextureCache<P>::TickFrame() {
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         LOG_INFO(HW_GPU, "nup: {} render targets relocated ({} from the pool) in 600 frames", nup_relocated, nup_pooled);
         nup_relocated = nup_pooled = 0;
+        LOG_INFO(HW_GPU,
+                 "Texture cache last 600 frames: {} GPU memory unmaps hit {} images, {} unmapped "
+                 "images deleted early",
+                 unmap_calls, unmapped_flagged, swept_unmapped);
+        unmap_calls = unmapped_flagged = swept_unmapped = 0;
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
@@ -635,8 +646,17 @@ void TextureCache<P>::TickFrame() {
                      shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
                      (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
                      created_shapes[key].second);
+            const auto& why = created_why[key];
+            LOG_INFO(HW_GPU,
+                     "    {} addresses; overlaps joined {} bad {} ignored {} aliased {}; in region: "
+                     "same shape+addr {} same shape other addr {} other shape {}, remapped {} "
+                     "bad-overlap {} same start {}",
+                     created_addrs[key].size(), why[1], why[2], why[3], why[4], why[5], why[6],
+                     why[7], why[8], why[9], why[10]);
         }
         created_shapes.clear();
+        created_why.clear();
+        created_addrs.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr; // nup: keep the shape tallies on
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
@@ -651,6 +671,7 @@ void TextureCache<P>::TickFrame() {
         seen_failed_images = failed;
     }
     SweepSuperseded();
+    SweepUnmapped();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
@@ -1845,7 +1866,54 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
             continue;
         }
         image.flags |= ImageFlagBits::Remapped;
+        ++unmapped_flagged;
+        unmapped_sweep_until = frame_tick + 4; // see SweepUnmapped
     }
+    unmap_calls += !deleted_images.empty();
+}
+
+template <class P>
+void TextureCache<P>::SweepUnmapped() {
+    // An image whose GPU memory the game unmapped is never found again: FindImage and the
+    // overlap checks skip Remapped images, and the flag is never cleared. It only held its
+    // memory until the collector's age limit reached it (50 frames, 10 near the budget), with a
+    // download first when the GPU had drawn into it. Ocarina of Time with a 3440x1440 picture
+    // (ultrawide mod) unmaps and maps its render-target memory again every frame or two while
+    // the camera turns in the Castle Town guard house, about 45 targets (~110 MiB) each time:
+    // the dead sets piled up to several GiB (driver usage 15.7 GiB on a 12 GiB card), the
+    // collector deleted 35 images a frame and the game ran at 15-25 fps. Delete them two frames
+    // after their last use instead, without a download (their memory is unmapped: there is
+    // nowhere to write them back to). That also hands render targets back to the image pool in
+    // time for the set that replaces them. Sparse images keep their own handling.
+    // EDEN_NX2_SWEEP_UNMAPPED=0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SWEEP_UNMAPPED");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || frame_tick < 2 || frame_tick > unmapped_sweep_until) {
+        return;
+    }
+    std::vector<ImageId> dead;
+    lru_cache.ForEachItemBelow(frame_tick - 2, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Remapped) &&
+            True(image.flags & ImageFlagBits::Registered) &&
+            False(image.flags & (ImageFlagBits::IsDecoding | ImageFlagBits::Sparse |
+                                 ImageFlagBits::UnwrittenSparse | ImageFlagBits::SparseLayers |
+                                 ImageFlagBits::SparseTiles))) {
+            dead.push_back(image_id);
+        }
+        return false;
+    });
+    for (const ImageId image_id : dead) {
+        Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+    }
+    swept_unmapped += dead.size();
 }
 
 template <class P>
@@ -3793,6 +3861,28 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             auto& shape = created_shapes[key];
             ++shape.first;
             shape.second = gpu_addr;
+            // nup debug: why a new image was needed. What it overlapped, and how the overlapped
+            // images compare (same shape at another address, another shape, flags).
+            auto& why = created_why[key];
+            ++why[0];
+            why[1] += join_overlap_ids.size();
+            why[2] += join_bad_overlap_ids.size();
+            why[3] += join_ignore_textures.size();
+            why[4] += join_left_aliased_ids.size() + join_right_aliased_ids.size();
+            if (created_addrs[key].size() < 4096) {
+                created_addrs[key].insert(gpu_addr);
+            }
+            ForEachImageInRegion(cpu_addr, size_bytes, [&](ImageId, ImageBase& other) {
+                const bool same = other.info.size == new_info.size &&
+                                  other.info.format == new_info.format &&
+                                  other.info.type == new_info.type;
+                why[5] += same && other.gpu_addr == gpu_addr;
+                why[6] += same && other.gpu_addr != gpu_addr;
+                why[7] += !same;
+                why[8] += True(other.flags & ImageFlagBits::Remapped);
+                why[9] += True(other.flags & ImageFlagBits::BadOverlap);
+                why[10] += other.cpu_addr == cpu_addr;
+            });
         }
         ++images_created;
     }

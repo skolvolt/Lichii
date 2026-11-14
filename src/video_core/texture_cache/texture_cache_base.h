@@ -12,6 +12,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -223,6 +224,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+    std::map<u64, std::array<u64, 11>> created_why; ///< nup debug (EDEN_NX2_TC_LOG)
+    std::map<u64, std::set<GPUVAddr>> created_addrs; ///< nup debug (EDEN_NX2_TC_LOG)
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
@@ -586,6 +589,14 @@ private:
     /// a while whose memory a newer image of another shape has used since (see the definition).
     void SweepSuperseded();
     u64 swept_superseded{}; ///< Since the last report
+
+    /// nup: deletes images whose GPU memory the game unmapped two frames after their last use,
+    /// instead of leaving them to the collector's age limit (see the definition).
+    void SweepUnmapped();
+    u64 unmapped_sweep_until{}; ///< Last frame SweepUnmapped has anything to look for
+    u64 unmap_calls{};          ///< Unmaps that hit an image, since the last report
+    u64 unmapped_flagged{};     ///< Images those unmaps flagged, since the last report
+    u64 swept_unmapped{};       ///< Images SweepUnmapped deleted, since the last report
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);

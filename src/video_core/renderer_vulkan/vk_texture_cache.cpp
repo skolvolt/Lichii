@@ -3135,7 +3135,11 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
 }
 
 void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u64 bytes) {
-    static constexpr u64 MaxBytes = u64{512} << 20;
+    // EDEN_NX2_IMAGE_POOL_MIB: how much the pool may hold (default 512).
+    static const u64 MaxBytes = [] {
+        const char* value = std::getenv("EDEN_NX2_IMAGE_POOL_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : u64{512}) << 20;
+    }();
     if (!key.valid || !image || bytes > MaxBytes) {
         return;
     }
